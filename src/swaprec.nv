@@ -1,0 +1,248 @@
+// swaprec.nv: the A/B swap, with a progress record in the status region
+// that lets the next boot finish a swap a reset interrupted.
+//
+// The swap exchanges the first `n` bytes of slot A and slot B, whole
+// erase units, one unit at a time through the swap area, in three steps
+// per unit u:
+//
+//   step 3u      slot A's unit into the swap area
+//   step 3u + 1  slot B's unit into slot A
+//   step 3u + 2  the swap area into slot B's unit
+//
+// Each step erases its destination and copies its source.  A step's
+// source is erased only by the step after it, so a step can be done
+// again from the start for as long as the next one has not begun.
+//
+// The record, little-endian words from the status region's first byte
+// (docs/embedded/bootloader.md, The status region):
+//
+//   0x00  "SWAP" once the two words after it are written; 0 once the
+//         swap is over
+//   0x04  n, the bytes of each slot the swap exchanges
+//   0x08  n inverted
+//   0x0C  "DONE" once the last step has finished
+//   0x20  a word per step, the step's number with 0x57000000, written
+//         before the step begins
+//
+// Flash clears bits and an erase sets them, so each word is written
+// once from 0xFFFFFFFF and the record is cleared by an erase.  A boot
+// that finds a live record does the step whose word is the last one
+// written again, then every step after it, then clears the record; a
+// word torn by a reset as it was written reads as written, and its step
+// had not begun, so doing it is the same as doing it again.  A record
+// is live only when the magic and both copies of n agree, so an erase
+// a reset interrupted, which leaves the bits of the region in no
+// particular state, does not read as one.
+
+pub const REC_MAGIC = 0x50415753
+pub const REC_DONE = 0x454E4F44
+pub const REC_STEP = 0x57000000
+pub const REC_STEPS = 0x20
+
+// The bench's cut: the number of the point at which a swap this boot
+// started resets the core, as a power cut would, or -1 for none.  The
+// points of step i are 3i, after its word is written; 3i + 1, after its
+// destination is erased; and 3i + 2, after half its copy.  9999 is
+// after the record's header and before the first step's word, 10000
+// after the complete word, and 10001 after the magic is cleared.  The
+// bench builds the bootloader with each in turn; the bootloader as it
+// ships has none.
+let CUT_AT = -1
+
+// Where the regions are: slot A, slot B, the swap area and the status
+// region, from the board's [flash] table, which the caller reads.
+pub @value
+struct Layout
+    a: Int
+    b: Int
+    sw: Int
+    st: Int
+    st_bytes: Int
+    slot_bytes: Int
+
+@tier(embedded)
+fn word(lay: Layout, off: Int) -> Int [hw]
+    hw.mmio_read(lay.st + off, 32)
+
+@tier(embedded)
+fn put(lay: Layout, off: Int, w: Int) -> Int [hw]
+    hal.boot.write_word(lay.st + off, w)
+
+@tier(embedded)
+fn say(s: Str) [hw]
+    hal.uart.write(s)
+
+@tier(embedded)
+fn say_int(n: Int) [hw]
+    var div = 1
+    for _d in 0..9
+        if div * 10 <= n
+            div = div * 10
+    for _d in 0..10
+        if div >= 1
+            hal.uart.write_byte(48 + (n / div) % 10)
+            div = div / 10
+
+@tier(embedded)
+fn say_kv(name: Str, v: Int) [hw]
+    say(name)
+    say("=")
+    say_int(v)
+    say("\n")
+
+// The cut, at point `p` of a swap this boot started.
+@tier(embedded)
+fn cut(p: Int, fresh: Bool) [hw]
+    // cov: skip — the body runs only in the bench's cut builds, and the core resets before a probe can read the coverage table
+    if fresh and p == CUT_AT
+        say_kv("cut", p)
+        hal.timer.delay_ms(1000)
+        // AIRCR: VECTKEY and SYSRESETREQ, the reset a power cut stands for.
+        hw.dsb()
+        hw.mmio_write(0xE000ED0C, 32, 0x05FA0004)
+        while true
+            hw.dsb()
+
+// Erases the units of [addr, addr + n).
+@tier(embedded)
+pub fn erase_range(addr: Int, n: Int) -> Int [hw]
+    var off = 0
+    for _u in 0..1024
+        if off < n
+            let rc = hal.boot.erase(addr + off)
+            if rc != 0
+                // cov: skip — runs only when the flash refuses an erase inside a slot, which a healthy chip never does
+                return rc
+            off = off + hal.boot.unit_bytes(addr + off)
+    0
+
+// The number of erase units in the first `n` bytes of slot A, and the
+// offset of unit `u` in a slot; both slots have the same units.
+@tier(embedded)
+fn units_in(lay: Layout, n: Int) -> Int [hw]
+    let a = lay.a
+    var off = 0
+    var k = 0
+    for _u in 0..1024
+        if off < n
+            off = off + hal.boot.unit_bytes(a + off)
+            k = k + 1
+    k
+
+@tier(embedded)
+fn unit_offset(lay: Layout, u: Int) -> Int [hw]
+    let a = lay.a
+    var off = 0
+    for _u in 0..u
+        off = off + hal.boot.unit_bytes(a + off)
+    off
+
+// Step `i`: erase its destination, then copy its source in two halves.
+@tier(embedded)
+fn step(lay: Layout, i: Int, fresh: Bool) -> Int [hw]
+    let off = unit_offset(lay, i / 3)
+    let a = lay.a + off
+    let b = lay.b + off
+    let sw = lay.sw
+    let len = hal.boot.unit_bytes(a)
+    let phase = i % 3
+    let dst = if phase == 0 then sw else if phase == 1 then a else b
+    let src = if phase == 0 then a else if phase == 1 then b else sw
+    // A watchdog an image on trial started is still running after a reset
+    // the watchdog did not cause, on a chip whose watchdog only its own
+    // reset stops; each step is far shorter than a trial's timeout.
+    hal.watchdog.feed()
+    var rc = erase_range(dst, len)
+    cut(3 * i + 1, fresh)
+    let half = len / 2
+    if rc == 0
+        rc = hal.boot.copy(dst, src, half)
+    cut(3 * i + 2, fresh)
+    if rc == 0
+        rc = hal.boot.copy(dst + half, src + half, len - half)
+    rc
+
+// Erases the status region.
+@tier(embedded)
+fn clear(lay: Layout) -> Int [hw]
+    erase_range(lay.st, lay.st_bytes)
+
+// The steps from `first` to the last, each word written before its step,
+// then the complete word, the magic cleared and the region erased.
+@tier(embedded)
+fn run(lay: Layout, n: Int, first: Int, fresh: Bool) -> Int [hw]
+    let steps = 3 * units_in(lay, n)
+    var rc = 0
+    for i in first..steps
+        if rc == 0
+            if i > first or fresh
+                rc = put(lay, REC_STEPS + 4 * i, REC_STEP | i)
+            cut(3 * i, fresh)
+        if rc == 0
+            rc = step(lay, i, fresh)
+    if rc != 0
+        // cov: skip — runs only when the flash refuses an erase or a write inside a slot, which a healthy chip never does
+        return rc
+    put(lay, 0x0C, REC_DONE)
+    cut(10000, fresh)
+    put(lay, 0x00, 0)
+    cut(10001, fresh)
+    say_kv("swap steps", steps)
+    clear(lay)
+
+// Exchanges slot A and slot B over their first `n` bytes, through the
+// swap area, recording each step.
+@tier(embedded)
+pub fn swap(lay: Layout, n: Int) -> Int [hw]
+    let units = units_in(lay, n)
+    let span = unit_offset(lay, units)
+    var rc = clear(lay)
+    if rc == 0
+        rc = put(lay, 0x04, span)
+    if rc == 0
+        rc = put(lay, 0x08, span ^ 0xFFFFFFFF)
+    if rc == 0
+        rc = put(lay, 0x00, REC_MAGIC)
+    if rc != 0
+        // cov: skip — runs only when the flash refuses an erase or a write of the status region, which a healthy chip never does
+        return rc
+    say_kv("swap bytes", span)
+    cut(9999, true)
+    run(lay, span, 0, true)
+
+// Whether the status region holds a live record: the magic, and n and
+// its inverse agreeing, n inside a slot.
+@tier(embedded)
+fn live(lay: Layout) -> Bool [hw]
+    let n = word(lay, 0x04)
+    word(lay, 0x00) == REC_MAGIC and (n ^ word(lay, 0x08)) == 0xFFFFFFFF and n > 0
+        and n <= lay.slot_bytes
+
+// At boot, before the slots are read: a swap a reset interrupted is
+// finished, from the step whose word is the last one written, and a
+// record whose swap had finished is cleared.  Answers 1 when it finished
+// a swap, 0 when there was none, and the flash's refusal otherwise.
+@tier(embedded)
+pub fn resume(lay: Layout) -> Int [hw]
+    if not live(lay)
+        return 0
+    let n = word(lay, 0x04)
+    if word(lay, 0x0C) == REC_DONE
+        say("swap record complete, cleared\n")
+        put(lay, 0x00, 0)
+        return clear(lay)
+    let steps = 3 * units_in(lay, n)
+    var last = 0
+    for i in 0..steps
+        if word(lay, REC_STEPS + 4 * i) != 0xFFFFFFFF
+            last = i
+    say_kv("swap resumed at step", last)
+    // The first step's word is written here when the reset came before
+    // it was; every later step's is written by the run.
+    if word(lay, REC_STEPS) == 0xFFFFFFFF
+        put(lay, REC_STEPS, REC_STEP)
+    let rc = run(lay, n, last, false)
+    if rc != 0
+        // cov: skip — runs only when the flash refuses an erase or a write, which a healthy chip never does
+        return rc
+    1

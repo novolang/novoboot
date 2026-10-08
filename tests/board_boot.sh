@@ -13,8 +13,15 @@
 #   LED_ADDR    the GPIO output register of the board's LED, as hex
 #   LED_BIT     the LED's bit in it
 #
-# The slots, the header size and the erase unit come from the board's
-# [flash] table through the build.
+# and may set TRIAL_MS, a trial timeout for the bench's main bootloader
+# in place of the table's, for a board whose probe takes longer than the
+# default's 4 s to attach to an image on trial, and may define
+# SETTLE_WATCHDOG, which leaves no watchdog running behind blink on a
+# chip whose watchdog the probe's reset does not stop (the nRF52's),
+# run after blink is written.
+#
+# The slots, the status region, the header size and the erase unit come
+# from the board's [flash] table through the build.
 #
 # Without a board the suite builds: the bootloader for the board with
 # `--role=bootloader`, with and without coverage hooks and with
@@ -32,23 +39,31 @@
 #      on trial under the watchdog, never confirmed; the watchdog resets
 #      the board and the next boot reverts it: slot A is app1 again, and
 #      slot B holds app2 marked tried, which is never tried again;
-#   3. app2 pending in slot B with one bit of its image changed is
+#   3. a swap of app4 into slot A cut by a reset of the core at each
+#      point of each step (after the step's word is written, after its
+#      destination is erased, after half its copy), after the record's
+#      header and after its complete word and its cleared magic, each from a
+#      bootloader built to cut there: the next boot finishes the swap
+#      from the step it was in, both slots check whole, and app4 runs;
+#      then the probe resets the board at moments the suite does not
+#      choose during a swap, with the same outcome;
+#   4. app2 pending in slot B with one bit of its image changed is
 #      refused for its hash and slot A runs;
-#   4. app2 pending in slot B with its image half written is refused;
-#   5. slot A with one bit of its header changed is refused for its CRC,
+#   5. app2 pending in slot B with its image half written is refused;
+#   6. slot A with one bit of its header changed is refused for its CRC,
 #      and the image in slot B is restored into slot A and runs;
-#   6. headers built for another chip, another board, another header
+#   7. headers built for another chip, another board, another header
 #      version and a size past the slot are each refused;
-#   7. a bootloader built with `signing = "required"`: an unsigned image
+#   8. a bootloader built with `signing = "required"`: an unsigned image
 #      is refused and nothing starts; a signed image starts; the same
 #      image with one bit changed is refused for its hash, re-hashed it
 #      is refused for its signature, and with S + L in place of S it is
 #      refused; a bootloader with no key refuses a signed image;
-#   8. the measured time of the hash and the signature check, from the
+#   9. the measured time of the hash and the signature check, from the
 #      bootloader without coverage hooks;
-#   9. every line of the bootloader's and the header library's device
+#  10. every line of the bootloader's and the header library's device
 #      path ran, but for a line a `cov: skip` marker excuses;
-#  10. blink built with `--role=application`, flashed into slot A, and
+#  11. blink built with `--role=application`, flashed into slot A, and
 #      started by the bootloader, its LED pin read toggling.
 #
 # The board is left with the bootloader in its first sectors and blink
@@ -135,11 +150,17 @@ stage_boot() {
     "$NV/novo.toml" > "$dir/novo.toml"
   [ -n "$table" ] && printf '\n%s\n' "$table" >> "$dir/novo.toml"
 }
-# The board's table with signing switched to required, as a project's
-# table, which wins over the board's.
+# The board's table with signing switched to required and a trial
+# timeout of its own, as a project's table, which wins over the board's.
 REQ_TABLE=$(sed -n '/^\[flash\]/,/^# hand-edit flash end/p' "$BOARD_DIR/novo.toml" \
-              | grep -v '^#' | sed 's/^signing .*/signing     = "required"/')
-stage_boot "$WORK/b_opt" ""
+              | grep -v '^#' | grep -v '^trial_ms' \
+              | sed 's/^signing .*/signing     = "required"\ntrial_ms    = 2500/')
+OPT_TABLE=""
+if [ -n "${TRIAL_MS:-}" ]; then
+  OPT_TABLE=$(sed -n '/^\[flash\]/,/^# hand-edit flash end/p' "$BOARD_DIR/novo.toml" \
+                | grep -v '^#' | grep -v '^trial_ms'; echo "trial_ms    = $TRIAL_MS")
+fi
+stage_boot "$WORK/b_opt" "$OPT_TABLE"
 stage_boot "$WORK/b_req" "$REQ_TABLE"
 build_boot() {
   local dir="$1" out="$2" log="$3"; shift 3
@@ -167,7 +188,7 @@ sed "s|^novofs = { path = \"../novofs\" }|novofs = { path = \"$REPO/orbit/novofs
   "$NV/novo.toml" > "$WORK/b_fast/novo.toml"
 printf '\n%s\n' "$REQ_TABLE" >> "$WORK/b_fast/novo.toml"
 sed -i 's/^let HOLD_MS = .*/let HOLD_MS = 4000/' "$WORK/b_fast/src/main.nv"
-if NOVO_CONFIG="$WORK/config.toml" build_boot "$WORK/b_fast" "$WORK/boot_fast.elf" "$WORK/boot_fast.log" --memory-report=none; then
+if NOVO_CONFIG="$WORK/config.toml" build_boot "$WORK/b_fast" "$WORK/boot_fast.elf" "$WORK/boot_fast.log"; then
   pass "and without coverage hooks, for the times"
 else
   fail "the bootloader without coverage hooks does not build" "$(tail -8 "$WORK/boot_fast.log")"; finish
@@ -177,6 +198,13 @@ for elf in boot.elf boot_fast.elf; do
   echo "    $elf: $size bytes of flash"
 done
 BOOT_BYTES=$(arm-none-eabi-size "$WORK/boot_fast.elf" | awk 'NR == 2 {print $1 + $2}')
+BOOT_REGION=$(sed -n 's/^bootloader *= *\[[^,]*, *\(0x[0-9A-Fa-f]*\)\].*/\1/p' "$BOARD_DIR/novo.toml")
+BOOT_REGION=$((BOOT_REGION))
+if [ "$BOOT_BYTES" -lt 65536 ] && [ "$BOOT_BYTES" -le "$BOOT_REGION" ]; then
+  pass "the bootloader without coverage hooks is $BOOT_BYTES bytes, under 65,536 and inside its $BOOT_REGION-byte region: $(grep -o 'flash  .*' "$WORK/boot_fast.log" | head -1)"
+else
+  fail "the bootloader is $BOOT_BYTES bytes, against 65,536 and its $BOOT_REGION-byte region"
+fi
 if grep -q "hal.watchdog on" "$WORK/boot.log"; then
   pass "the bootloader's hal.watchdog is the board's driver: $(grep -o 'hal.watchdog on [A-Za-z0-9_]*' "$WORK/boot.log")"
 else
@@ -197,7 +225,7 @@ app() {
   rm -f "$BOARD_DIR/tests/.boot_app_$name.nv"
   [ $rc = 0 ] && [ -f "$WORK/$name.img" ]
 }
-for spec in "app1 true 1.0.0" "app2 false 2.0.0" "app3 true 3.0.0 --sign"; do
+for spec in "app1 true 1.0.0" "app2 false 2.0.0" "app3 true 3.0.0 --sign" "app4 true 2.0.0"; do
   # shellcheck disable=SC2086
   if app $spec; then
     pass "$(cut -d' ' -f1 <<< "$spec") builds with --role=application: $(grep -o 'stamped the image header[^;]*' "$WORK/$(cut -d' ' -f1 <<< "$spec").log" | cut -c1-120)"
@@ -229,7 +257,7 @@ fi
 SEL="${!BENCH_VAR:-}"
 if [ -z "$SEL" ]; then
   echo ""
-  skip "$BENCH_VAR is unset; set it to the board's probe to run sections 2 to 10"
+  skip "$BENCH_VAR is unset; set it to the board's probe to run sections 2 to 11"
   finish
 fi
 if ! command -v probe-rs > /dev/null 2>&1; then
@@ -305,6 +333,11 @@ boot() {
 run_app() {
   sleep 5
   watch "$WORK/$3.log" "$2" 15 attach "$1"
+  # A probe whose USB transport fails to open is asked once more.
+  if ! grep -aqE -- "$2" "$WORK/$3.log" && grep -aq "Failed to open probe" "$WORK/$3.log"; then
+    sleep 1
+    watch "$WORK/$3.log" "$2" 15 attach "$1"
+  fi
   OUT=$(clean "$WORK/$3.log")
 }
 # put <file> <hex addr>: bytes written into the flash by address, the
@@ -325,6 +358,11 @@ fi
 boot "$WORK/boot.elf" s2
 expect "novoboot"                                  "the bootloader runs from the flash's reset address"
 expect "signing required=0"                        "with signing optional, the board's table"
+if [ -n "${TRIAL_MS:-}" ]; then
+  expect "trial ms=$TRIAL_MS"                      "and the trial's timeout the bench's, $TRIAL_MS ms"
+else
+  expect "trial ms=4000"                           "and the trial's timeout the default, 4000 ms, the board's table naming none"
+fi
 expect "key=1"                                     "and the run's public key built in"
 expect "slot a: ok v1.0.0 unsigned"                "slot A: app1's header, hash and policy pass"
 expect "slot b: empty"                             "slot B holds no header"
@@ -350,8 +388,10 @@ expect "rule: swap, trial a"                       "the rule swaps it into slot 
 expect "slot a: ok v2.0.0 unsigned pending"        "slot A holds app2 after the swap"
 expect "tried mark=0"                              "the tried word is written"
 expect "watchdog started=1"                        "the watchdog is armed for the trial"
-swapped=$(value "swapped bytes")
-[ -n "$swapped" ] && pass "the swap moved $swapped bytes of each slot through the swap area"
+expect "watchdog ms=${TRIAL_MS:-4000}"             "with the table's trial_ms as its timeout"
+swapped=$(value "swap bytes")
+STEPS=$(value "swap steps")
+[ -n "$swapped" ] && pass "the swap moved $swapped bytes of each slot through the swap area, recording $(value "swap steps") steps in the status region"
 run_app "$WORK/app2.elf" "app running" s3app
 expect "app app2"                                  "app2 runs on trial"
 expect "confirmed after=0"                         "and does not confirm itself, nor feed the watchdog"
@@ -398,9 +438,94 @@ else
 fi
 put "$WORK/app1.img" "$SLOT_A"
 
-# ── 4. a corrupt update ────────────────────────────────────────────────────
+# ── 4. a reset at every step of a swap ────────────────────────────────────
 echo ""
-echo "4. a corrupt image and a half-written image are refused"
+echo "4. a swap cut by a reset at each step, finished by the next boot"
+# app1 in slot A and app4, which confirms itself, pending in slot B: the
+# rule swaps them.  Each bootloader here is built to reset the core at one
+# point of the swap the boot starts (swaprec.nv, CUT_AT); the boot after
+# the reset finds the record, finishes the swap from the step it was in,
+# checks both slots whole and starts app4 on trial.
+python3 "$TOOL" pend "$WORK/app4.img" "$WORK/app4_pend.img"
+STATUS=$(sed -n 's/^status *= *\[0x\([0-9A-Fa-f]*\),.*/\1/p' "$BOARD_DIR/novo.toml")
+cut_case() {
+  local p="$1" want="$2" dir="$WORK/b_cut_$1"
+  stage_boot "$dir" ""
+  sed -i "s/^let CUT_AT = .*/let CUT_AT = $p/" "$dir/src/swaprec.nv"
+  # A build that resolves the registry dependency again can meet a
+  # registry it does not reach for a moment; it is tried twice.
+  if ! NOVO_CONFIG="$WORK/config.toml" build_boot "$dir" "$WORK/boot_cut_$p.elf" "$WORK/boot_cut_$p.log" --cov \
+     && ! { sleep 5; NOVO_CONFIG="$WORK/config.toml" build_boot "$dir" "$WORK/boot_cut_$p.elf" "$WORK/boot_cut_$p.log" --cov; }; then
+    fail "the bootloader cutting at point $p does not build" "$(tail -6 "$WORK/boot_cut_$p.log")"
+    return
+  fi
+  pr download "$WORK/boot_cut_$p.elf" > "$WORK/dl.log" 2>&1
+  put "$WORK/app1.img" "$SLOT_A"
+  put "$WORK/app4_pend.img" "$SLOT_B"
+  boot "$WORK/boot_cut_$p.elf" "s4_$p"
+  local ok=1 line
+  for line in "cut=$p" "$want" "slot a: ok v2.0.0 unsigned pending" "slot b: ok v1.0.0 unsigned" "rule: trial a"; do
+    grep -qxF -- "$line" <<< "$OUT" || { ok=0; fail "cut at point $p: no line '$line'" "$(grep -av '^\s*$' <<< "$OUT" | tail -16)"; }
+  done
+  [ $ok = 1 ] || return
+  run_app "$WORK/app4.elf" "app running" "s4_${p}app"
+  if grep -qxF "confirmed after=1" <<< "$OUT"; then
+    pass "cut at point $p: '$want', both slots whole after it (app4 in A, app1 in B, each hash checked), and app4 runs and confirms"
+  else
+    fail "cut at point $p: app4 did not run after the finished swap" "$OUT"
+  fi
+}
+# The three points of each step of the first unit and of the last, which
+# on a board whose image spans one unit are the same three steps.
+STEPS=${STEPS:-3}
+for i in $( (seq 0 2; seq $((STEPS - 3)) $((STEPS - 1))) | sort -nu); do
+  for k in $((3 * i)) $((3 * i + 1)) $((3 * i + 2)); do
+    cut_case "$k" "swap resumed at step=$i"
+  done
+done
+cut_case 9999 "swap resumed at step=0"
+cut_case 10000 "swap record complete, cleared"
+st=$(word "0x$STATUS")
+[ "$st" = "ffffffff" ] && pass "and the record whose swap had finished is erased" \
+                        || fail "the status region's first word reads ${st:-nothing}"
+# After the magic is cleared the record is over: the next boot reads the
+# slots as the swap left them, app4 pending in A and app1 in B, and
+# leaves the region as it is until the next swap erases it.
+cut_case 10001 "signing required=0"
+st=$(word "0x$STATUS")
+[ "$st" = "00000000" ] && pass "and a record whose magic is cleared is not read as one: its first word reads 0" \
+                        || fail "the status region's first word reads ${st:-nothing}"
+
+# A reset by the probe at a moment the suite does not choose: some time
+# from 0.3 s to 7 s into the boot, over the whole of a swap.
+pr download "$WORK/boot.elf" > "$WORK/dl.log" 2>&1
+for n in 1 2 3 4; do
+  put "$WORK/app1.img" "$SLOT_A"
+  put "$WORK/app4_pend.img" "$SLOT_B"
+  delay=$(python3 -c "import random; print(round(random.uniform(0.3, 7.0), 2))")
+  pr reset > /dev/null 2>&1
+  sleep "$delay"
+  pr reset > /dev/null 2>&1
+  boot "$WORK/boot.elf" "s4r_$n" wait
+  how=$(grep -aoE "swap resumed at step=[0-9]+|swap record complete, cleared|rule: swap, trial a|rule: trial a" <<< "$OUT" | head -1)
+  run_app "$WORK/app4.elf" "app running" "s4r_${n}app"
+  boot "$WORK/boot.elf" "s4r_${n}v"
+  if grep -qxF "slot a: ok v2.0.0 unsigned pending tried confirmed" <<< "$OUT" \
+     && grep -qxF "slot b: ok v1.0.0 unsigned" <<< "$OUT"; then
+    pass "a probe reset ${delay} s into the boot ($how): app4 in A confirmed and app1 in B, both whole"
+  else
+    fail "after a probe reset ${delay} s into the boot ($how)" "$(grep -av '^\s*$' <<< "$OUT" | tail -12)"
+  fi
+done
+st=$(word "0x$STATUS")
+[ "$st" = "ffffffff" ] && pass "the status region is erased once each swap is over" \
+                        || fail "the status region's first word reads ${st:-nothing}"
+put "$WORK/app1.img" "$SLOT_A"
+put "$WORK/erased_slot.bin" "$SLOT_B"
+
+# ── 5. a corrupt update ────────────────────────────────────────────────────
+echo ""
+echo "5. a corrupt image and a half-written image are refused"
 python3 "$TOOL" flip "$WORK/app2_pend.img" "$WORK/app2_bad.img" $((HDR + 0x400)) 3
 put "$WORK/app2_bad.img" "$SLOT_B"
 boot "$WORK/boot.elf" s4
@@ -416,9 +541,9 @@ expect "rule: boot a"                              "and slot A runs"
 run_app "$WORK/app1.elf" "app running" s4app
 expect "app app1"                                  "app1 runs"
 
-# ── 5. a corrupt running image, and the other slot ─────────────────────────
+# ── 6. a corrupt running image, and the other slot ─────────────────────────
 echo ""
-echo "5. slot A corrupt: refused, and slot B's image restored into it"
+echo "6. slot A corrupt: refused, and slot B's image restored into it"
 put "$WORK/app1.img" "$SLOT_B"
 python3 "$TOOL" flip "$WORK/app1.img" "$WORK/app1_badhdr.img" 0x10 0
 put "$WORK/app1_badhdr.img" "$SLOT_A"
@@ -430,9 +555,9 @@ expect "slot a: ok v1.0.0 unsigned"                "slot A holds it after the sw
 run_app "$WORK/app1.elf" "app running" s5app
 expect "app app1"                                  "and it runs"
 
-# ── 6. headers for something else ──────────────────────────────────────────
+# ── 7. headers for something else ──────────────────────────────────────────
 echo ""
-echo "6. images built for another chip or board, or with a header this bootloader does not read"
+echo "7. images built for another chip or board, or with a header this bootloader does not read"
 for spec in "0x14 0x12345678 wrong chip" "0x18 0x12345678 wrong board" \
             "0x04 0x00000002 bad header" "0x08 0x7FFFFFFF bad size"; do
   read -r off val what <<< "$spec"
@@ -442,9 +567,9 @@ for spec in "0x14 0x12345678 wrong chip" "0x18 0x12345678 wrong board" \
   expect "slot b: $what"                           "a header with $off set to $val is refused: $what"
 done
 
-# ── 7. signing ─────────────────────────────────────────────────────────────
+# ── 8. signing ─────────────────────────────────────────────────────────────
 echo ""
-echo "7. signing = \"required\""
+echo "8. signing = \"required\""
 put "$WORK/erased_slot.bin" "$SLOT_B"
 if pr download "$WORK/boot_req.elf" > "$WORK/dl.log" 2>&1; then
   pass "the bootloader built with signing required is flashed"
@@ -453,6 +578,7 @@ else
 fi
 boot "$WORK/boot_req.elf" s7
 expect "signing required=1"                        "it reads the project's table"
+expect "trial ms=2500"                             "and its trial_ms, 2500"
 expect "slot a: unsigned confirmed"                "app1, unsigned, is refused"
 expect "rule: halt"                                "and with slot B empty"
 expect "no image to start"                         "nothing starts"
@@ -479,23 +605,25 @@ boot "$WORK/boot_nokey.elf" s7f
 expect "key=0"                                     "a bootloader built with no signing key configured"
 expect "slot a: no key"                            "refuses the signed image it cannot check"
 
-# ── 8. the times ───────────────────────────────────────────────────────────
+# ── 9. the times ───────────────────────────────────────────────────────────
 echo ""
-echo "8. the hash and the signature check, timed without coverage hooks"
+echo "9. the hash and the signature check, timed without coverage hooks"
 pr download "$WORK/boot_fast.elf" > "$WORK/dl.log" 2>&1
 boot "$WORK/boot_fast.elf" s8
 expect "slot a: ok v3.0.0 signed"                  "the signed image verifies"
 hash_us=$(value "hash us"); hash_b=$(value "hash bytes"); ver_us=$(value "verify us")
-if [ -n "$hash_us" ] && [ -n "$ver_us" ]; then
-  pass "SHA-256 of $hash_b bytes: $hash_us us ($(( hash_b * 1000000 / (hash_us > 0 ? hash_us : 1) / 1024 )) KB/s); Ed25519 verification: $ver_us us"
+if [ -n "$hash_us" ] && [ -n "$ver_us" ] && [ "$hash_us" = 0 ]; then
+  pass "the times are printed, and read 0: the board's hal.timer counts only the time spent in its delays"
+elif [ -n "$hash_us" ] && [ -n "$ver_us" ]; then
+  pass "SHA-256 of $hash_b bytes: $hash_us us ($(( hash_b * 1000000 / hash_us / 1024 )) KB/s); Ed25519 verification: $ver_us us"
 else
   fail "the times were not printed" "$OUT"
 fi
 echo "    bootloader: $BOOT_BYTES bytes of flash"
 
-# ── 9. coverage ────────────────────────────────────────────────────────────
+# ── 10. coverage ────────────────────────────────────────────────────────────
 echo ""
-echo "9. line coverage of the bootloader and the header library, on the board"
+echo "10. line coverage of the bootloader and the header library, on the board"
 merge() {
   python3 - "$@" <<'PY'
 import sys
@@ -507,14 +635,15 @@ for p in ins:
 open(out, "wb").write(bytes(acc or b""))
 PY
 }
-# The three coverage builds come from the same source with the same
-# lines, so their tables are the same shape and merge by OR.
+# The coverage builds come from the same source with the same lines,
+# the cut builds differing only in a constant, so their tables are the
+# same shape and merge by OR.
 shopt -s nullglob
 tables=("$WORK"/cov_*.bin)
 shopt -u nullglob
 if [ ${#tables[@]} -gt 0 ]; then
   merge "$WORK/cov.bin" "${tables[@]}"
-  for f in main bootimg abrule imghash sha2 fe25519 ed25519 bytes32; do
+  for f in main bootimg abrule swaprec imghash sha2 fe25519 ed25519 bytes32; do
     if cov=$(cd "$WORK/b_opt" && python3 "$REPO/scripts/device_coverage.py" "$WORK/boot.elf" "$WORK/cov.bin" \
                "$WORK/b_opt/_novo/main_$SLUG" "src/$f.nv" 2>&1); then
       pass "every line of $f.nv with a hook ran: $(grep -o 'covered .*' <<< "$cov" | tail -1)"
@@ -526,9 +655,9 @@ else
   fail "no coverage table was read"
 fi
 
-# ── 10. blink, last ────────────────────────────────────────────────────────
+# ── 11. blink, last ────────────────────────────────────────────────────────
 echo ""
-echo "10. blink in slot A, started by the bootloader"
+echo "11. blink in slot A, started by the bootloader"
 # The bootloader as it ships: the board's table, no wait before the
 # jump, and no key, so it starts an unsigned image.
 if (cd "$NV" && NOVO_CONFIG="$WORK/nokey.toml" "$NOVO" build --target="$SLUG" --role=bootloader \
@@ -543,6 +672,9 @@ if put "$WORK/blink.img" "$SLOT_A" && pr reset > /dev/null 2>&1; then
   pass "blink written into slot A behind the bootloader, the board reset"
 else
   fail "blink could not be written"; finish
+fi
+if declare -F SETTLE_WATCHDOG > /dev/null; then
+  SETTLE_WATCHDOG
 fi
 sleep 3
 seen=""

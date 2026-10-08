@@ -64,24 +64,18 @@ impl B64
     fn put(var self, i: Int, x: Int)
         self.b[i] = (x & 255) as u8
 
-    @tier(embedded)
-    fn at(self, i: Int) -> Int
-        self.b[i] as Int
-
     // The 64-bit word `w` as eight big-endian bytes from `at`.
     @tier(embedded)
     fn put_be64(var self, at: Int, w: Int)
         for j in 0..8
             self.b[at + j] = ((w >>> (56 - 8 * j)) & 255) as u8
 
-    // Bytes 0 to 31, or 32 to 63.
+    // Bytes 0 to 31, or 32 to 63, into `out`.
     @tier(embedded)
-    fn half(self, upper: Bool) -> B32
-        var out = b32_zero()
+    fn half_into(var self, var out: B32, upper: Bool)
         let base = if upper then 32 else 0
         for i in 0..32
-            out.put(i, self.b[base + i] as Int)
-        out
+            out.b[i] = self.b[base + i]
 
 @tier(embedded)
 pub fn b32_zero() -> B32
@@ -95,10 +89,11 @@ pub fn b64_zero() -> B64
               0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
               0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] }
 
-// Whether two 32-byte strings hold the same bytes.
+// Whether two 32-byte strings hold the same bytes.  Both are `var`
+// parameters, passed by address, so the call copies nothing.
 @tier(embedded)
-pub fn b32_eq(a: B32, b: B32) -> Bool
+pub fn b32_eq(var a: B32, var b: B32) -> Bool
     var diff = 0
     for i in 0..32
-        diff = diff | (a.at(i) ^ b.at(i))
+        diff = diff | ((a.b[i] ^ b.b[i]) as Int)
     diff == 0

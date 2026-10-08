@@ -24,11 +24,6 @@ pub @value
 struct Blk
     w: [Int; 16]
 
-impl Blk
-    @tier(embedded)
-    fn put(var self, i: Int, x: Int)
-        self.w[i] = x
-
 @tier(embedded)
 pub fn blk_zero() -> Blk
     Blk { w: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] }
@@ -231,9 +226,9 @@ fn k512(t: Int) -> Int
         78 => 0x5FCB6FAB3AD6FAEC
         _ => 0x6C44198C4A475817
 
-// One block into a SHA-256 state (FIPS 180-4 § 6.2.2).
+// One block into a SHA-256 state, in place (FIPS 180-4 § 6.2.2).
 @tier(embedded)
-pub fn sha256_compress(st: H8, b: Blk) -> H8
+pub fn sha256_compress(var st: H8, var b: Blk)
     var w = sched_zero()
     for t in 0..16
         w.put(t, b.w[t])
@@ -266,21 +261,19 @@ pub fn sha256_compress(st: H8, b: Blk) -> H8
         c = bb
         bb = a
         a = (t1 + t2) & 0xFFFFFFFF
-    var out = st
-    out.put(0, (st.h[0] + a) & 0xFFFFFFFF)
-    out.put(1, (st.h[1] + bb) & 0xFFFFFFFF)
-    out.put(2, (st.h[2] + c) & 0xFFFFFFFF)
-    out.put(3, (st.h[3] + d) & 0xFFFFFFFF)
-    out.put(4, (st.h[4] + e) & 0xFFFFFFFF)
-    out.put(5, (st.h[5] + f) & 0xFFFFFFFF)
-    out.put(6, (st.h[6] + g) & 0xFFFFFFFF)
-    out.put(7, (st.h[7] + h) & 0xFFFFFFFF)
-    out
+    st.put(0, (st.h[0] + a) & 0xFFFFFFFF)
+    st.put(1, (st.h[1] + bb) & 0xFFFFFFFF)
+    st.put(2, (st.h[2] + c) & 0xFFFFFFFF)
+    st.put(3, (st.h[3] + d) & 0xFFFFFFFF)
+    st.put(4, (st.h[4] + e) & 0xFFFFFFFF)
+    st.put(5, (st.h[5] + f) & 0xFFFFFFFF)
+    st.put(6, (st.h[6] + g) & 0xFFFFFFFF)
+    st.put(7, (st.h[7] + h) & 0xFFFFFFFF)
 
-// One block into a SHA-512 state (FIPS 180-4 § 6.4.2).
+// One block into a SHA-512 state, in place (FIPS 180-4 § 6.4.2).
 @tier(embedded)
 @wrapping
-pub fn sha512_compress(st: H8, b: Blk) -> H8
+pub fn sha512_compress(var st: H8, var b: Blk)
     var w = sched_zero()
     for t in 0..16
         w.put(t, b.w[t])
@@ -313,13 +306,11 @@ pub fn sha512_compress(st: H8, b: Blk) -> H8
         c = bb
         bb = a
         a = t1 + t2
-    var out = st
-    out.put(0, st.h[0] + a)
-    out.put(1, st.h[1] + bb)
-    out.put(2, st.h[2] + c)
-    out.put(3, st.h[3] + d)
-    out.put(4, st.h[4] + e)
-    out.put(5, st.h[5] + f)
-    out.put(6, st.h[6] + g)
-    out.put(7, st.h[7] + h)
-    out
+    st.put(0, st.h[0] + a)
+    st.put(1, st.h[1] + bb)
+    st.put(2, st.h[2] + c)
+    st.put(3, st.h[3] + d)
+    st.put(4, st.h[4] + e)
+    st.put(5, st.h[5] + f)
+    st.put(6, st.h[6] + g)
+    st.put(7, st.h[7] + h)
