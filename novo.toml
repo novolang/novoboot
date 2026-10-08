@@ -10,5 +10,6 @@ stability   = "experimental"
 keywords    = ["embedded", "bootloader", "ed25519", "sha256", "firmware-update"]
 
 [dependencies]
-# The CRC-32C a header carries is novofs's.
-novofs = { path = "../novofs" }
+# The CRC-32C a header carries, from crc-nv's functions that need no
+# heap.
+crc-nv = "^0.1.6"

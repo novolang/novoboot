@@ -26,7 +26,7 @@
 use bytes32
 use imghash
 use ed25519
-use crc32
+use crc
 
 pub const HEADER_MAGIC = 0x42564F4E
 pub const HEADER_VERSION = 1
@@ -114,13 +114,13 @@ pub fn is_tried<S: ByteSource[e]>(slot: S) -> Bool [e]
 pub fn is_confirmed<S: ByteSource[e]>(slot: S) -> Bool [e]
     u32_at(slot, OFF_CONFIRMED) == STATE_CONFIRMED
 
-// The CRC-32C of the header's first 0x80 bytes, novofs's CRC.
+// The CRC-32C of the header's first 0x80 bytes.
 @tier(embedded)
 pub fn header_crc<S: ByteSource[e]>(slot: S) -> Int [e]
-    var c = 0xFFFFFFFF
+    var c = crc.crc32c_start()
     for i in 0..0x80
-        c = crc32.update(c, slot.src_at(i))
-    c ^ 0xFFFFFFFF
+        c = crc.crc32c_step(c, slot.src_at(i))
+    crc.crc32c_finish(c)
 
 // Every check but the hash and the signature: the magic, the CRC, the
 // version and sizes, the chip and the board.  `slot_bytes` is the

@@ -146,8 +146,7 @@ stage_boot() {
   mkdir -p "$dir"
   cp -r "$NV/src" "$dir/"
   sed -i 's/^let HOLD_MS = .*/let HOLD_MS = 4000/' "$dir/src/main.nv"
-  sed "s|^novofs = { path = \"../novofs\" }|novofs = { path = \"$REPO/orbit/novofs\" }|" \
-    "$NV/novo.toml" > "$dir/novo.toml"
+  cp "$NV/novo.toml" "$dir/novo.toml"
   [ -n "$table" ] && printf '\n%s\n' "$table" >> "$dir/novo.toml"
 }
 # The board's table with signing switched to required and a trial
@@ -184,8 +183,7 @@ else
 fi
 mkdir -p "$WORK/b_fast"
 cp -r "$NV/src" "$WORK/b_fast/"
-sed "s|^novofs = { path = \"../novofs\" }|novofs = { path = \"$REPO/orbit/novofs\" }|" \
-  "$NV/novo.toml" > "$WORK/b_fast/novo.toml"
+cp "$NV/novo.toml" "$WORK/b_fast/novo.toml"
 printf '\n%s\n' "$REQ_TABLE" >> "$WORK/b_fast/novo.toml"
 sed -i 's/^let HOLD_MS = .*/let HOLD_MS = 4000/' "$WORK/b_fast/src/main.nv"
 if NOVO_CONFIG="$WORK/config.toml" build_boot "$WORK/b_fast" "$WORK/boot_fast.elf" "$WORK/boot_fast.log"; then
