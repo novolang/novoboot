@@ -1,0 +1,14 @@
+[package]
+name        = "novoboot"
+version     = "0.1.0"
+main        = "src/main.nv"
+description = "A bootloader in novo-lang for boards with a [flash] table: it checks the image header of each slot (CRC-32C, the chip and board, SHA-256 of the image, an Ed25519 signature), runs the A/B rule with the copy into the first slot, and starts the image.  The header, the hash and the signature check are modules a host shares."
+license     = "Apache-2.0"
+category    = "embedded"
+layer       = "app"
+stability   = "experimental"
+keywords    = ["embedded", "bootloader", "ed25519", "sha256", "firmware-update"]
+
+[dependencies]
+# The CRC-32C a header carries is novofs's.
+novofs = { path = "../novofs" }

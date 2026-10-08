@@ -1,0 +1,104 @@
+// bytes32.nv: fixed byte strings for the signature check, and the
+// byte source a hash reads its message through.
+//
+// A key, a point's encoding and a scalar are 32 bytes, a signature 64.
+// Each is a `@value` struct around an inline `[u8; N]`, so it lives on
+// the stack and the check allocates nothing.  The arrays are written
+// through `put`, a `var self` method, since a `@value`'s data is
+// otherwise immutable (SPEC § 14.3).
+
+// Bytes a hash reads: `src_len` of them, the byte at `i` from
+// `src_at(i)` for `i` in 0 to `src_len() - 1`, and `src_window(off, n)`
+// the `n` bytes from `off` as a source of their own.  A device reads its
+// flash through an implementation with `[hw]`; a host reads a buffer.
+pub trait ByteSource[e]
+    fn src_len(self) -> Int [e]
+    fn src_at(self, i: Int) -> Int [e]
+    fn src_window(self, off: Int, n: Int) -> Self [e]
+
+// A range of the address space, read a byte at a time: a slot of the
+// chip's flash, which the core reads as memory.
+pub @value
+struct FlashRange
+    base: Int
+    n: Int
+
+impl ByteSource[hw] for FlashRange
+    @tier(embedded)
+    fn src_len(self) -> Int [hw]
+        self.n
+
+    @tier(embedded)
+    fn src_at(self, i: Int) -> Int [hw]
+        hw.mem_read8(self.base + i)
+
+    @tier(embedded)
+    fn src_window(self, off: Int, n: Int) -> FlashRange [hw]
+        FlashRange { base: self.base + off, n: n }
+
+pub @value
+struct B32
+    b: [u8; 32]
+
+impl B32
+    @tier(embedded)
+    fn put(var self, i: Int, x: Int)
+        self.b[i] = (x & 255) as u8
+
+    @tier(embedded)
+    fn at(self, i: Int) -> Int
+        self.b[i] as Int
+
+    // The 32-bit word `w` as four big-endian bytes from `at`.
+    @tier(embedded)
+    fn put_be32(var self, at: Int, w: Int)
+        for j in 0..4
+            self.b[at + j] = ((w >> (24 - 8 * j)) & 255) as u8
+
+pub @value
+struct B64
+    b: [u8; 64]
+
+impl B64
+    @tier(embedded)
+    fn put(var self, i: Int, x: Int)
+        self.b[i] = (x & 255) as u8
+
+    @tier(embedded)
+    fn at(self, i: Int) -> Int
+        self.b[i] as Int
+
+    // The 64-bit word `w` as eight big-endian bytes from `at`.
+    @tier(embedded)
+    fn put_be64(var self, at: Int, w: Int)
+        for j in 0..8
+            self.b[at + j] = ((w >>> (56 - 8 * j)) & 255) as u8
+
+    // Bytes 0 to 31, or 32 to 63.
+    @tier(embedded)
+    fn half(self, upper: Bool) -> B32
+        var out = b32_zero()
+        let base = if upper then 32 else 0
+        for i in 0..32
+            out.put(i, self.b[base + i] as Int)
+        out
+
+@tier(embedded)
+pub fn b32_zero() -> B32
+    B32 { b: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+              0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] }
+
+@tier(embedded)
+pub fn b64_zero() -> B64
+    B64 { b: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+              0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+              0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+              0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] }
+
+// Whether two 32-byte strings hold the same bytes.
+@tier(embedded)
+pub fn b32_eq(a: B32, b: B32) -> Bool
+    var diff = 0
+    for i in 0..32
+        diff = diff | (a.at(i) ^ b.at(i))
+    diff == 0

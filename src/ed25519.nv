@@ -1,0 +1,334 @@
+// ed25519.nv: Ed25519 signature verification (RFC 8032 § 5.1.7), with
+// nothing allocated and no randomness needed.
+//
+// A signature is R, the encoding of a point, and S, a scalar.  It is
+// valid for the public key A and the message M when
+//
+//     [S]B = R + [k]A,   k = SHA-512(R || A || M) mod L,
+//
+// B being the curve's base point and L its prime order.  The check here
+// computes [S]B + [k](-A) and compares its encoding with R's bytes.  The
+// points are in extended twisted-Edwards coordinates (X : Y : Z : T),
+// x = X/Z, y = Y/Z, xy = T/Z, with the addition and doubling formulas
+// of Hisil, Wong, Carter and Dawson (2008) for a = -1, which RFC 8032
+// § 5.1.4 prints.
+//
+// The checks RFC 8032 asks for, and the pitfalls the reference
+// implementations read for this (SUPERCOP's ref10, TweetNaCl,
+// Monocypher) document, each kept:
+//
+//   - S must be below L (§ 5.1.7 step 1).  Without it a signature has
+//     a second valid form, S + L, the malleability ref10 originally
+//     allowed and later releases refuse; `sc_below_l` refuses it.
+//   - A's encoding must be canonical: a y of p or above is refused
+//     (§ 5.1.3 step 1), where Monocypher and ref10 accept it.  R is
+//     compared by bytes with an encoding this file writes, which is
+//     always canonical, so a non-canonical R never matches.
+//   - A point whose x^2 has no square root is not on the curve and is
+//     refused (§ 5.1.3 step 3), as is x = 0 with the sign bit set
+//     (step 4).
+//   - The hash covers R, then A, then M, in that order, and its 512 bits
+//     are reduced modulo L as one little-endian number (§ 5.1.7 step 2).
+//   - The equation is checked without the cofactor 8, as ref10 and
+//     libsodium check it; § 5.1.7 allows either.  A signature made by a
+//     conforming signer verifies under both.
+//   - Small-order public keys are not refused: the key a bootloader
+//     checks against is built into its image, not chosen by whoever
+//     supplies the image.
+//
+// Nothing here is secret, so the double-scalar multiplication is a
+// plain double-and-add whose time depends on the scalars.
+
+use bytes32
+use fe25519
+
+pub @value
+struct Ge
+    x: Fe
+    y: Fe
+    z: Fe
+    t: Fe
+
+// A point decoded from 32 bytes, and whether the bytes were one.
+pub @value
+struct Decoded
+    ok: Bool
+    p: Ge
+
+@tier(embedded)
+pub fn ge_identity() -> Ge
+    Ge { x: fe_zero(), y: fe_one(), z: fe_one(), t: fe_zero() }
+
+// The base point B: y = 4/5, x the even root (RFC 8032 § 5.1).
+@tier(embedded)
+pub fn ge_base() -> Ge
+    Ge { x: Fe { v: [0x325d51a, 0x18b5823, 0xf6592a, 0x104a92d, 0x1a4b31d,
+                     0x1d6dc5c, 0x27118fe, 0x7fd814, 0x13cd6e5, 0x85a4db] },
+         y: Fe { v: [0x2666658, 0x1999999, 0xcccccc, 0x1333333, 0x1999999,
+                     0x666666, 0x3333333, 0xcccccc, 0x2666666, 0x1999999] },
+         z: fe_one(),
+         t: Fe { v: [0x1b7dda3, 0x1a2ace9, 0x25eadbb, 0x3ba8a, 0x83c27e,
+                     0xabe37d, 0x1274732, 0xccacdd, 0xfd78b7, 0x19e1d7c] } }
+
+// P + Q, "add-2008-hwcd-3" for a = -1 (RFC 8032 § 5.1.4).
+@tier(embedded)
+pub fn ge_add(p: Ge, q: Ge) -> Ge
+    let a = fe_mul(fe_sub(p.y, p.x), fe_sub(q.y, q.x))
+    let b = fe_mul(fe_add(p.y, p.x), fe_add(q.y, q.x))
+    let c = fe_mul(fe_mul(p.t, fe_d2()), q.t)
+    let d = fe_mul(fe_add(p.z, p.z), q.z)
+    let e = fe_sub(b, a)
+    let f = fe_sub(d, c)
+    let g = fe_add(d, c)
+    let h = fe_add(b, a)
+    Ge { x: fe_mul(e, f), y: fe_mul(g, h), z: fe_mul(f, g), t: fe_mul(e, h) }
+
+// 2P, "dbl-2008-hwcd" for a = -1, with every intermediate negated, which
+// leaves the products as they are and saves the negation of x^2.
+@tier(embedded)
+pub fn ge_dbl(p: Ge) -> Ge
+    let a = fe_sq(p.x)
+    let b = fe_sq(p.y)
+    let c = fe_add(fe_sq(p.z), fe_sq(p.z))
+    let h = fe_add(a, b)
+    let e = fe_sub(h, fe_sq(fe_add(p.x, p.y)))
+    let g = fe_sub(a, b)
+    let f = fe_add(c, g)
+    Ge { x: fe_mul(e, f), y: fe_mul(g, h), z: fe_mul(f, g), t: fe_mul(e, h) }
+
+@tier(embedded)
+pub fn ge_neg(p: Ge) -> Ge
+    Ge { x: fe_neg(p.x), y: p.y, z: p.z, t: fe_neg(p.t) }
+
+// The 32-byte encoding of P: y, with x's least significant bit in the
+// top bit (RFC 8032 § 5.1.2).
+@tier(embedded)
+pub fn ge_encode(p: Ge) -> B32
+    let zi = fe_invert(p.z)
+    let x = fe_mul(p.x, zi)
+    let y = fe_mul(p.y, zi)
+    var out = fe_to_bytes(y)
+    out.put(31, out.at(31) | (if fe_is_odd(x) then 128 else 0))
+    out
+
+// The point a 32-byte encoding names (RFC 8032 § 5.1.3), refused when y
+// is not below p, when x^2 has no square root, or when x is 0 and the
+// sign bit is set.
+@tier(embedded)
+pub fn ge_decode(s: B32) -> Decoded
+    let refused = Decoded { ok: false, p: ge_identity() }
+    let sign = (s.at(31) >> 7) & 1
+    let y = fe_from_bytes(s)
+    // Canonical: the bytes of y below p are the input's, top bit aside.
+    let back = fe_to_bytes(y)
+    var same = true
+    for i in 0..32
+        let want = if i == 31 then s.at(31) & 127 else s.at(i)
+        same = same and back.at(i) == want
+    if not same
+        // cov: skip — runs only for a key whose y is p or above; the bootloader's key is the build's, a canonical encoding by construction, and the host vectors refuse such a key
+        return refused
+    let yy = fe_sq(y)
+    let u = fe_sub(yy, fe_one())
+    let v = fe_add(fe_mul(fe_d(), yy), fe_one())
+    // x = u v^3 (u v^7)^((p - 5) / 8)
+    let v3 = fe_mul(fe_sq(v), v)
+    let v7 = fe_mul(fe_sq(v3), v)
+    var x = fe_mul(fe_mul(u, v3), fe_pow2523(fe_mul(u, v7)))
+    let vxx = fe_mul(v, fe_sq(x))
+    // v x^2 is u when x is the root, -u when x times sqrt(-1) is; neither
+    // when u / v has no square root and the bytes name no point.
+    let root = fe_eq(vxx, u)
+    if not root and not fe_eq(vxx, fe_neg(u))
+        // cov: skip — runs only for a key that is not a curve point; the bootloader's key is the build's public key, a point by construction
+        return refused
+    x = if root then x else fe_mul(x, fe_sqrtm1())
+    if fe_is_zero(x) and sign == 1
+        // cov: skip — runs only for the encoding of x = 0 with the sign bit set, which no public key is
+        return refused
+    if (if fe_is_odd(x) then 1 else 0) != sign
+        x = fe_neg(x)
+    Decoded { ok: true, p: Ge { x: x, y: y, z: fe_one(), t: fe_mul(x, y) } }
+
+// ── Scalars modulo L ─────────────────────────────────────────────────
+
+// A scalar as eight 32-bit words, least significant first.
+pub @value
+struct Sc
+    w: [Int; 8]
+
+impl Sc
+    @tier(embedded)
+    fn put(var self, k: Int, x: Int)
+        self.w[k] = x
+
+@tier(embedded)
+fn sc_zero() -> Sc
+    Sc { w: [0, 0, 0, 0, 0, 0, 0, 0] }
+
+// L = 2^252 + 27742317777372353535851937790883648493, by word.
+@tier(embedded)
+fn l_word(k: Int) -> Int
+    match k
+        0 => 0x5cf5d3ed
+        1 => 0x5812631a
+        2 => 0xa2f79cd6
+        3 => 0x14def9de
+        7 => 0x10000000
+        _ => 0
+
+// Whether s >= L.
+@tier(embedded)
+fn sc_ge_l(s: Sc) -> Bool
+    for n in 0..8
+        let k = 7 - n
+        if s.w[k] != l_word(k)
+            return s.w[k] > l_word(k)
+    // cov: skip — runs only when s is L exactly, which a signature's S is with probability 2^-253 and the reduction's remainder about as rarely
+    true
+
+// s - L, for s >= L.
+@tier(embedded)
+fn sc_sub_l(s: Sc) -> Sc
+    var r = sc_zero()
+    var borrow = 0
+    for k in 0..8
+        var d = s.w[k] - l_word(k) - borrow
+        borrow = 0
+        if d < 0
+            d = d + 0x100000000
+            borrow = 1
+        r.put(k, d)
+    r
+
+// 2s + bit.
+@tier(embedded)
+fn sc_shl1(s: Sc, bit: Int) -> Sc
+    var r = sc_zero()
+    var c = bit
+    for k in 0..8
+        r.put(k, ((s.w[k] << 1) | c) & 0xFFFFFFFF)
+        c = s.w[k] >>> 31
+    r
+
+// The 64-byte little-endian number `h` modulo L, as 32 bytes: a bit at a
+// time from the top, doubling the remainder and taking L off when it
+// reaches it.  512 steps of eight words, which costs far less than one
+// point operation.
+@tier(embedded)
+pub fn sc_reduce64(h: B64) -> B32
+    var r = sc_zero()
+    for n in 0..512
+        let i = 511 - n
+        r = sc_shl1(r, (h.at(i >> 3) >> (i & 7)) & 1)
+        if sc_ge_l(r)
+            r = sc_sub_l(r)
+    var out = b32_zero()
+    for k in 0..8
+        for j in 0..4
+            out.put(4 * k + j, (r.w[k] >> (8 * j)) & 255)
+    out
+
+// Whether the 32-byte little-endian scalar `s` is below L.
+@tier(embedded)
+pub fn sc_below_l(s: B32) -> Bool
+    var w = sc_zero()
+    for k in 0..8
+        w.put(k, s.at(4 * k) | (s.at(4 * k + 1) << 8) | (s.at(4 * k + 2) << 16)
+                 | (s.at(4 * k + 3) << 24))
+    not sc_ge_l(w)
+
+@tier(embedded)
+fn bit_of(s: B32, i: Int) -> Int
+    (s.at(i >> 3) >> (i & 7)) & 1
+
+// [s]B + [k]P for scalars below L, which have no bit past 252: one
+// doubling per bit, and an addition of B, P or B + P where the bits ask
+// for one (Straus's joint form).
+@tier(embedded)
+pub fn double_scalar_mul(s: B32, k: B32, p: Ge) -> Ge
+    let b = ge_base()
+    let bp = ge_add(b, p)
+    var acc = ge_identity()
+    for n in 0..253
+        let i = 252 - n
+        acc = ge_dbl(acc)
+        let sb = bit_of(s, i)
+        let kb = bit_of(k, i)
+        if sb == 1 and kb == 1
+            acc = ge_add(acc, bp)
+        else if sb == 1
+            acc = ge_add(acc, b)
+        else if kb == 1
+            acc = ge_add(acc, p)
+    acc
+
+// ── SHA-512 over R || A || M ─────────────────────────────────────────
+
+use sha2
+
+// Byte `i` of R || A || M.
+@tier(embedded)
+fn ram_at<S: ByteSource[e]>(r: B32, a: B32, msg: S, i: Int, total: Int) -> Int [e]
+    if i < 32
+        return r.at(i)
+    if i < 64
+        return a.at(i - 32)
+    if i < total
+        return msg.src_at(i - 64)
+    if i == total
+        return 0x80
+    0
+
+// Word `k` (big-endian, eight bytes) of the padded message's block
+// starting at byte `base`; the last sixteen bytes of the last block are
+// the message's length in bits (FIPS 180-4 § 5.1.2), whose upper half is
+// zero for any message here.
+@tier(embedded)
+fn ram_word<S: ByteSource[e]>(r: B32, a: B32, msg: S, base: Int, k: Int, total: Int,
+                              padded: Int) -> Int [e]
+    let off = base + 8 * k
+    if off == padded - 8
+        return total * 8
+    var w = 0
+    for j in 0..8
+        w = (w << 8) | ram_at(r, a, msg, off + j, total)
+    w
+
+@tier(embedded)
+fn ram_block<S: ByteSource[e]>(r: B32, a: B32, msg: S, base: Int, total: Int,
+                               padded: Int) -> Blk [e]
+    var b = blk_zero()
+    for k in 0..16
+        b.put(k, ram_word(r, a, msg, base, k, total, padded))
+    b
+
+// SHA-512(R || A || M), as 64 bytes.
+@tier(embedded)
+pub fn sha512_ram<S: ByteSource[e]>(r: B32, a: B32, msg: S) -> B64 [e]
+    let total = 64 + msg.src_len()
+    let padded = (total + 17 + 127) / 128 * 128
+    var st = sha2.sha512_init()
+    for n in 0..(padded / 128)
+        st = sha2.sha512_compress(st, ram_block(r, a, msg, n * 128, total, padded))
+    var out = b64_zero()
+    for i in 0..8
+        out.put_be64(8 * i, st.h[i])
+    out
+
+// ── The check ────────────────────────────────────────────────────────
+
+// Whether `sig` is an Ed25519 signature of the message `msg` under the
+// public key `pk` (RFC 8032 § 5.1.7).
+@tier(embedded)
+pub fn verify<S: ByteSource[e]>(pk: B32, sig: B64, msg: S) -> Bool [e]
+    let r = sig.half(false)
+    let s = sig.half(true)
+    if not sc_below_l(s)
+        return false
+    let a = ge_decode(pk)
+    if not a.ok
+        // cov: skip — runs only for a key that does not decode, which the bootloader's built-in key always does
+        return false
+    let k = sc_reduce64(sha512_ram(r, pk, msg))
+    b32_eq(ge_encode(double_scalar_mul(s, k, ge_neg(a.p))), r)

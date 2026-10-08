@@ -1,0 +1,52 @@
+// abrule_tests: the A/B rule, case by case.
+//
+//   novo test tests/abrule_tests.nv
+
+use std.test
+use abrule
+
+fn st(valid: Bool, pending: Bool, tried: Bool, confirmed: Bool) -> SlotState
+    SlotState { valid: valid, pending: pending, tried: tried, confirmed: confirmed }
+
+fn plain() -> SlotState
+    st(true, false, false, false)
+
+fn confirmed() -> SlotState
+    st(true, false, false, true)
+
+fn update() -> SlotState
+    st(true, true, false, false)
+
+fn failed() -> SlotState
+    st(true, true, true, false)
+
+fn trial_ok() -> SlotState
+    st(true, true, true, true)
+
+fn none() -> SlotState
+    st(false, false, false, false)
+
+@test
+fn test_rule()
+    test.assert_eq(abrule.decide(plain(), none()), ACT_BOOT, "an image written by a probe starts")
+    test.assert_eq(abrule.decide(confirmed(), none()), ACT_BOOT, "a confirmed image starts")
+    test.assert_eq(abrule.decide(confirmed(), update()), ACT_SWAP_TRIAL, "an update in B is swapped in and tried")
+    test.assert_eq(abrule.decide(update(), none()), ACT_TRIAL, "an update written into A is tried in place")
+    test.assert_eq(abrule.decide(failed(), confirmed()), ACT_REVERT, "a failed trial goes back to B's image")
+    test.assert_eq(abrule.decide(failed(), none()), ACT_BOOT, "a failed trial with nothing behind it starts again")
+    test.assert_eq(abrule.decide(failed(), failed()), ACT_BOOT, "two failed trials do not swap forever")
+    test.assert_eq(abrule.decide(trial_ok(), failed()), ACT_BOOT, "a confirmed trial starts, B's failed trial is left")
+    test.assert_eq(abrule.decide(trial_ok(), plain()), ACT_BOOT, "a confirmed trial starts, the old image stays in B")
+    test.assert_eq(abrule.decide(none(), confirmed()), ACT_RESTORE, "a bad A is restored from B")
+    test.assert_eq(abrule.decide(none(), failed()), ACT_HALT, "a failed trial is never restored")
+    test.assert_eq(abrule.decide(none(), none()), ACT_HALT, "nothing to start")
+    test.assert_eq(abrule.decide(confirmed(), failed()), ACT_BOOT, "a failed trial in B is not tried again")
+
+@test
+fn test_action_names()
+    test.assert_eq_str(abrule.action_name(ACT_BOOT), "boot a")
+    test.assert_eq_str(abrule.action_name(ACT_TRIAL), "trial a")
+    test.assert_eq_str(abrule.action_name(ACT_SWAP_TRIAL), "swap, trial a")
+    test.assert_eq_str(abrule.action_name(ACT_REVERT), "revert")
+    test.assert_eq_str(abrule.action_name(ACT_RESTORE), "restore from b")
+    test.assert_eq_str(abrule.action_name(ACT_HALT), "halt")

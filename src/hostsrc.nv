@@ -1,0 +1,32 @@
+// hostsrc.nv: a byte source over a `Bytes` buffer, for checking a slot
+// image or a message on the host with the same code the device runs.
+//
+// Every function here is `@tier(app)`: a device build of the bootloader
+// assembles this module with the rest of the package and leaves these
+// functions out, since nothing it runs reaches them.
+
+use std.bytes
+use bytes32
+
+pub struct BytesSrc
+    data: Bytes
+    off: Int
+    n: Int
+
+impl ByteSource[] for BytesSrc
+    @tier(app)
+    fn src_len(self) -> Int
+        self.n
+
+    // A byte past the buffer reads 0xFF, as erased flash does.
+    @tier(app)
+    fn src_at(self, i: Int) -> Int
+        bytes.byte_at(self.data, self.off + i) ?? 0xFF
+
+    @tier(app)
+    fn src_window(self, off: Int, n: Int) -> BytesSrc
+        BytesSrc { data: self.data, off: self.off + off, n: n }
+
+@tier(app)
+pub fn bytes_src(b: Bytes) -> BytesSrc
+    BytesSrc { data: b, off: 0, n: bytes.len(b) }

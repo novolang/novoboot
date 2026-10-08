@@ -1,0 +1,76 @@
+// abrule.nv: the A/B layout's rule, which image to start and what to
+// move first, from what the two slots hold.
+//
+// The image always runs from slot A.  An update is written into slot B
+// and marked pending; the bootloader swaps the two slots through the
+// swap area, so slot A holds the update and slot B the image it
+// replaces, marks the update tried, and starts it.  The update confirms
+// itself once it runs as it should.  At the next reset an update that is
+// tried and not confirmed failed its trial: the bootloader swaps back,
+// and the update, now in slot B marked tried, is never tried again.
+//
+// The rule, first match wins:
+//
+//   1. slot A failed its trial (valid, pending, tried, not confirmed):
+//      swap back when slot B holds an image that did not fail its own
+//      trial, else start slot A again, since there is nothing to go
+//      back to;
+//   2. slot B holds an update not yet tried: swap, then start it on
+//      trial;
+//   3. slot A is pending and not tried, as an update written straight
+//      into it is: start it on trial;
+//   4. slot A is valid: start it;
+//   5. slot A is not valid and slot B holds an image that did not fail
+//      its trial: swap, and start it;
+//   6. otherwise there is nothing to start.
+//
+// An image written into slot A by a probe, with no state word set, is
+// valid and starts under rule 4; it is not on trial, so it is never
+// reverted, and a confirmation is optional for it.
+
+// What a slot holds, as the rule reads it.
+pub @value
+struct SlotState
+    valid: Bool
+    pending: Bool
+    tried: Bool
+    confirmed: Bool
+
+pub const ACT_BOOT = 0
+pub const ACT_TRIAL = 1
+pub const ACT_SWAP_TRIAL = 2
+pub const ACT_REVERT = 3
+pub const ACT_RESTORE = 4
+pub const ACT_HALT = 5
+
+@tier(embedded)
+fn failed(s: SlotState) -> Bool
+    s.valid and s.pending and s.tried and not s.confirmed
+
+// The action for slot A's and slot B's states.
+@tier(embedded)
+pub fn decide(a: SlotState, b: SlotState) -> Int
+    let b_usable = b.valid and not failed(b)
+    if failed(a)
+        if b_usable
+            return ACT_REVERT
+        return ACT_BOOT
+    if b.valid and b.pending and not b.tried
+        return ACT_SWAP_TRIAL
+    if a.valid and a.pending and not a.tried
+        return ACT_TRIAL
+    if a.valid
+        return ACT_BOOT
+    if b_usable
+        return ACT_RESTORE
+    ACT_HALT
+
+@tier(embedded)
+pub fn action_name(act: Int) -> Str
+    match act
+        0 => "boot a"
+        1 => "trial a"
+        2 => "swap, trial a"
+        3 => "revert"
+        4 => "restore from b"
+        _ => "halt"

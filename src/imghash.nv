@@ -1,0 +1,55 @@
+// imghash.nv: SHA-256 (FIPS 180-4 § 6.2) of the bytes a ByteSource
+// gives, with nothing allocated.
+//
+// The compression function is sha2.nv's; this module feeds it 64-byte
+// blocks of big-endian words read from the source, and the padding of
+// § 5.1.1:
+// the byte 0x80 after the message, zeros, and the message's length in
+// bits as the block's last eight bytes.  An image of n bytes costs
+// ceil((n + 9) / 64) compressions.
+
+use bytes32
+use sha2
+
+// Byte `i` of the padded message of `total` bytes, the length word
+// aside.
+@tier(embedded)
+fn padded_at<S: ByteSource[e]>(src: S, i: Int, total: Int) -> Int [e]
+    if i < total
+        return src.src_at(i)
+    if i == total
+        return 0x80
+    0
+
+// Word `k` of the block starting at byte `base`.  The last two words of
+// the padded message are the length in bits, of which the upper word is
+// zero for any message below 512 MB.
+@tier(embedded)
+fn word_at<S: ByteSource[e]>(src: S, base: Int, k: Int, total: Int, padded: Int) -> Int [e]
+    let off = base + 4 * k
+    if off == padded - 4
+        return (total * 8) & 0xFFFFFFFF
+    if off == padded - 8
+        return (total * 8) >> 32
+    (padded_at(src, off, total) << 24) | (padded_at(src, off + 1, total) << 16)
+        | (padded_at(src, off + 2, total) << 8) | padded_at(src, off + 3, total)
+
+@tier(embedded)
+fn block_at<S: ByteSource[e]>(src: S, base: Int, total: Int, padded: Int) -> Blk [e]
+    var b = blk_zero()
+    for k in 0..16
+        b.put(k, word_at(src, base, k, total, padded))
+    b
+
+// SHA-256 of the source's `src_len()` bytes.
+@tier(embedded)
+pub fn sha256_of<S: ByteSource[e]>(src: S) -> B32 [e]
+    let total = src.src_len()
+    let padded = (total + 9 + 63) / 64 * 64
+    var st = sha2.sha256_init()
+    for n in 0..(padded / 64)
+        st = sha2.sha256_compress(st, block_at(src, n * 64, total, padded))
+    var out = b32_zero()
+    for i in 0..8
+        out.put_be32(4 * i, st.h[i])
+    out

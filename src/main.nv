@@ -1,0 +1,272 @@
+// main.nv: the bootloader, one program for every board whose manifest
+// has a `[flash]` table with the A/B layout.
+//
+//   novo build --target=<board> --role=bootloader src/main.nv
+//
+// It runs first, from the table's bootloader region.  It checks the
+// image header of slot A and slot B (bootimg.nv: the magic, the
+// header's CRC-32C, the version and sizes, the chip and board ids the
+// image was built for, the SHA-256 of the image, and the Ed25519
+// signature where the image carries one), applies the A/B rule
+// (abrule.nv), moves the images through the swap area when the rule
+// says so, and starts the image in slot A: the stack pointer and the
+// vector table base register from the image's vector table, then its
+// reset handler.
+//
+// It writes only slot A, slot B and the swap area, through hal.boot,
+// which refuses every other address: never its own region, and never
+// the data region, which the application formats and owns.
+//
+// Each step is a line over the log transport, which the bench reads:
+// the two slots' checks, the rule, the measured times of the hash and
+// the signature check, and the address it starts.
+
+use bytes32
+use bootimg
+use abrule
+
+// How long to wait before starting the image, in milliseconds.  0 in
+// use; the bench's coverage image waits so the probe can read the
+// coverage table before the image's start-up code clears the RAM it
+// is in.
+let HOLD_MS = 0
+
+// ── The log ──────────────────────────────────────────────────────────
+
+fn say(s: Str) [hw]
+    hal.uart.write(s)
+
+// `n`, at least 0, in decimal, a digit at a time, so the log allocates
+// nothing.
+fn say_int(n: Int) [hw]
+    var div = 1
+    for _d in 0..18
+        if div * 10 <= n
+            div = div * 10
+    for _d in 0..19
+        if div >= 1
+            hal.uart.write_byte(48 + (n / div) % 10)
+            div = div / 10
+
+fn say_hex(n: Int) [hw]
+    say("0x")
+    for k in 0..8
+        let d = (n >> (28 - 4 * k)) & 15
+        hal.uart.write_byte(if d < 10 then 48 + d else 87 + d)
+
+fn say_kv(name: Str, v: Int) [hw]
+    say(name)
+    say("=")
+    say_int(v)
+    say("\n")
+
+// ── The slots ────────────────────────────────────────────────────────
+
+fn slot_a() -> FlashRange [hw]
+    FlashRange { base: bsp.board.flash_slot_a_start(), n: bsp.board.flash_slot_a_bytes() }
+
+fn slot_b() -> FlashRange [hw]
+    FlashRange { base: bsp.board.flash_slot_b_start(), n: bsp.board.flash_slot_b_bytes() }
+
+// The public key this build carries, from the user's signing key at
+// build time; absent when the configuration names none.
+fn key_word(w: Int) -> Int [hw]
+    match w
+        0 => bsp.board.flash_key_0()
+        1 => bsp.board.flash_key_1()
+        2 => bsp.board.flash_key_2()
+        3 => bsp.board.flash_key_3()
+        4 => bsp.board.flash_key_4()
+        5 => bsp.board.flash_key_5()
+        6 => bsp.board.flash_key_6()
+        _ => bsp.board.flash_key_7()
+
+fn key() -> B32 [hw]
+    var k = b32_zero()
+    for w in 0..8
+        for j in 0..4
+            k.put(4 * w + j, (key_word(w) >> (8 * j)) & 255)
+    k
+
+// What an image must match: the header size of the table, the chip and
+// board this bootloader was built for, the signing policy and the key.
+// The chip id is the build's, not read from the chip: an identity word
+// is not readable by software on every chip once no debugger is
+// attached.
+fn policy() -> Policy [hw]
+    Policy { header_bytes: bsp.board.flash_header_bytes(), chip: bsp.board.flash_chip_id(),
+             board: bsp.board.flash_board_id(),
+             signing_required: bsp.board.flash_signing_required() == 1,
+             key_present: bsp.board.flash_key_present() == 1, key: key() }
+
+// The check of one slot, logged, with the time the hash and the
+// signature check took.
+fn check(name: Str, slot: FlashRange, pol: Policy) -> SlotState [hw]
+    var r = bootimg.check_header(slot, slot.n, pol)
+    if r == IMG_OK
+        let t0 = hal.timer.ticks_us()
+        let hashed = bootimg.check_hash(slot)
+        let t1 = hal.timer.ticks_us()
+        say_kv("hash us", t1 - t0)
+        say_kv("hash bytes", bootimg.image_bytes(slot))
+        if not hashed
+            r = IMG_BAD_HASH
+        else
+            let signed = (bootimg.flags(slot) & FLAG_UNSIGNED) == 0
+            let t2 = hal.timer.ticks_us()
+            r = bootimg.check_signature(slot, pol)
+            let t3 = hal.timer.ticks_us()
+            if signed
+                say_kv("verify us", t3 - t2)
+    let st = SlotState { valid: r == IMG_OK, pending: bootimg.is_pending(slot),
+                         tried: bootimg.is_tried(slot), confirmed: bootimg.is_confirmed(slot) }
+    say("slot ")
+    say(name)
+    say(": ")
+    say(bootimg.result_name(r))
+    if r == IMG_OK
+        let v = bootimg.version(slot)
+        say(" v")
+        say_int(v >> 24)
+        say(".")
+        say_int((v >> 16) & 255)
+        say(".")
+        say_int(v & 0xFFFF)
+        say((if (bootimg.flags(slot) & FLAG_UNSIGNED) != 0 then " unsigned" else " signed"))
+    say((if st.pending then " pending" else ""))
+    say((if st.tried then " tried" else ""))
+    say((if st.confirmed then " confirmed" else ""))
+    say("\n")
+    st
+
+// The bytes of a slot that hold its header and image, or the whole slot
+// when its header cannot be read.
+fn extent(slot: FlashRange, pol: Policy) -> Int [hw]
+    let r = bootimg.check_header(slot, slot.n, pol)
+    if r == IMG_OK or r >= IMG_WRONG_CHIP
+        return pol.header_bytes + bootimg.image_bytes(slot)
+    slot.n
+
+// Erases the units of [addr, addr + n).
+fn erase_range(addr: Int, n: Int) -> Int [hw]
+    var off = 0
+    for _u in 0..256
+        if off < n
+            let rc = hal.boot.erase(addr + off)
+            if rc != 0
+                // cov: skip — runs only when the flash refuses an erase inside a slot, which a healthy chip never does
+                return rc
+            off = off + hal.boot.unit_bytes(addr + off)
+    0
+
+// Exchanges slot A and slot B over their first `n` bytes, one erase
+// unit at a time through the swap area: the unit of A into the swap
+// area, B's into A, the swap area's into B.
+fn swap(n: Int) -> Int [hw]
+    let a = bsp.board.flash_slot_a_start()
+    let b = bsp.board.flash_slot_b_start()
+    let sw = bsp.board.flash_swap_start()
+    var off = 0
+    var rc = 0
+    for _u in 0..256
+        if rc == 0 and off < n
+            let u = hal.boot.unit_bytes(a + off)
+            rc = erase_range(sw, u)
+            if rc == 0
+                rc = hal.boot.copy(sw, a + off, u)
+            if rc == 0
+                rc = erase_range(a + off, u)
+            if rc == 0
+                rc = hal.boot.copy(a + off, b + off, u)
+            if rc == 0
+                rc = erase_range(b + off, u)
+            if rc == 0
+                rc = hal.boot.copy(b + off, sw, u)
+            off = off + u
+    say_kv("swapped bytes", off)
+    rc
+
+// An image on trial runs under the watchdog: one that hangs before it
+// confirms itself is reset, and the next boot reverts it.  The image
+// feeds the watchdog for as long as it runs (`hal.watchdog.feed()`),
+// since on most chips nothing but a reset stops it once started.  An
+// image not on trial starts with the watchdog as the reset left it.
+let TRIAL_WATCHDOG_MS = 4000
+
+fn arm_watchdog() [hw]
+    let started = hal.watchdog.start(TRIAL_WATCHDOG_MS)
+    say_kv("watchdog started", if started then 1 else 0)
+    say_kv("watchdog ms", hal.watchdog.timeout_ms())
+
+// Starts the image in slot A: interrupts off, SysTick off, every
+// interrupt line disabled and its pending bit cleared, the vector table
+// base register at the image's table, then, in privileged thread mode
+// on the main stack, the image's initial stack pointer and its reset
+// handler, with interrupts enabled as they are out of reset.
+fn start_image() [hw]
+    let vt = bsp.board.flash_slot_a_start() + bsp.board.flash_header_bytes()
+    let sp = hw.mmio_read(vt, 32)
+    let pc = hw.mmio_read(vt + 4, 32)
+    asm cortex_m { "cpsid i" }
+    hw.mmio_write(0xE000E010, 32, 0)
+    for i in 0..8
+        hw.mmio_write(0xE000E180 + 4 * i, 32, 0xFFFFFFFF)
+        hw.mmio_write(0xE000E280 + 4 * i, 32, 0xFFFFFFFF)
+    // ICSR: PENDSVCLR and PENDSTCLR.
+    hw.mmio_write(0xE000ED04, 32, 0x0A000000)
+    hw.mmio_write(0xE000ED08, 32, vt)
+    hw.dsb()
+    hw.isb()
+    say("start ")
+    say_hex(vt)
+    say("\n")
+    // The wait, a busy loop with interrupts off, fed every 100 ms so an
+    // armed watchdog does not reset the board in it and the image starts
+    // with the whole timeout.
+    for _t in 0..(HOLD_MS / 100)
+        hal.timer.delay_ms(100)
+        hal.watchdog.feed()
+    // cov: skip — the jump runs on every start, but the image's start-up code clears the RAM the coverage table is in before a probe can read the bit; the start line above and the image's own output show it ran
+    asm cortex_m
+        "msr control, r2\n\tisb\n\tmsr msp, r0\n\tcpsie i\n\tbx r1"
+        input stack = sp @ "{r0}"
+        input entry = pc @ "{r1}"
+        input zero = 0 @ "{r2}"
+        clobber "memory"
+
+// Nothing to start: said once, then the core waits for a reset.
+fn halt() [hw]
+    say("no image to start\n")
+    while true
+        asm cortex_m { "wfi" }
+
+fn main() [hw]
+    say("novoboot\n")
+    say_kv("reset reason", hal.watchdog.reset_reason())
+    let pol = policy()
+    say_kv("signing required", bsp.board.flash_signing_required())
+    say_kv("key", bsp.board.flash_key_present())
+    let a = check("a", slot_a(), pol)
+    let b = check("b", slot_b(), pol)
+    let act = abrule.decide(a, b)
+    say("rule: ")
+    say(abrule.action_name(act))
+    say("\n")
+    if act == ACT_HALT
+        halt()
+    if act == ACT_SWAP_TRIAL or act == ACT_REVERT or act == ACT_RESTORE
+        let ea = extent(slot_a(), pol)
+        let eb = extent(slot_b(), pol)
+        let rc = swap(if ea > eb then ea else eb)
+        if rc != 0
+            // cov: skip — runs only when the flash refuses an erase or a write inside a slot, which a healthy chip never does
+            say_kv("swap failed", rc)
+        let again = check("a", slot_a(), pol)
+        if not again.valid
+            // cov: skip — runs only when the copy did not take, after a refusal of the flash above
+            halt()
+    if act == ACT_TRIAL or act == ACT_SWAP_TRIAL
+        let rc = hal.boot.write_word(bsp.board.flash_slot_a_start() + OFF_TRIED, STATE_TRIED)
+        say_kv("tried mark", rc)
+        arm_watchdog()
+    start_image()

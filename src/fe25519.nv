@@ -1,0 +1,237 @@
+// fe25519.nv: arithmetic modulo p = 2^255 - 19, the field Ed25519's
+// curve is defined over (RFC 8032 § 5.1).
+//
+// An element is ten limbs in radix 2^25.5: limb i holds the bits from
+// ceil(25.5 i), 26 bits wide at an even index and 25 at an odd one, so
+// the ten widths add up to 255.  A product of limbs i and j lands at the
+// weight of limb i + j, twice it when both indices are odd (two half
+// bits), and a weight at or past 2^255 folds back down times 19, since
+// 2^255 = 19 modulo p.  With every limb within 2^26 after a carry, a
+// product term is below 2^57.3 and a sum of ten below 2^61, inside an
+// `Int`.  This is the representation of the reference implementation
+// in SUPERCOP (ref10), which was read for it; the code here is written
+// as loops over a width table rather than ref10's unrolled terms.
+//
+// Every operation carries its result, so each limb is back within its
+// width plus a little, and the bound above holds for any chain of
+// operations.  Only `to_bytes` reduces fully to the one canonical value
+// below p, which is what equality, the sign bit and an encoding read.
+//
+// Nothing here allocates, and nothing depends on a secret: the
+// signature check works on public values only, so the operations may
+// take time that depends on their inputs.
+
+use bytes32
+
+pub @value
+struct Fe
+    v: [Int; 10]
+
+impl Fe
+    @tier(embedded)
+    fn put(var self, k: Int, x: Int)
+        self.v[k] = x
+
+    @tier(embedded)
+    fn add_at(var self, k: Int, x: Int)
+        self.v[k] = self.v[k] + x
+
+// The width of limb i, 26 or 25 bits.
+@tier(embedded)
+fn width(i: Int) -> Int
+    if (i & 1) == 0 then 26 else 25
+
+@tier(embedded)
+pub fn fe_zero() -> Fe
+    Fe { v: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0] }
+
+@tier(embedded)
+pub fn fe_one() -> Fe
+    Fe { v: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0] }
+
+// Two passes of the carry chain: each limb keeps its own width and
+// gives the rest to the next, and the top limb's excess comes back into
+// limb 0 times 19.  After the first pass only limb 0 can be wide, by the
+// top limb's excess times 19; after the second every limb is within its
+// width, limb 0 within 19 of it.
+@tier(embedded)
+pub fn carry(f: Fe) -> Fe
+    var h = f
+    for _pass in 0..2
+        for i in 0..10
+            let w = width(i)
+            let c = h.v[i] >> w
+            h.put(i, h.v[i] & ((1 << w) - 1))
+            if i == 9
+                h.add_at(0, c * 19)
+            else
+                h.add_at(i + 1, c)
+    h
+
+@tier(embedded)
+pub fn fe_add(f: Fe, g: Fe) -> Fe
+    var h = fe_zero()
+    for i in 0..10
+        h.put(i, f.v[i] + g.v[i])
+    carry(h)
+
+@tier(embedded)
+pub fn fe_sub(f: Fe, g: Fe) -> Fe
+    var h = fe_zero()
+    for i in 0..10
+        h.put(i, f.v[i] - g.v[i])
+    carry(h)
+
+@tier(embedded)
+pub fn fe_neg(f: Fe) -> Fe
+    fe_sub(fe_zero(), f)
+
+// The product, by schoolbook multiplication over the limbs with the
+// fold described above.  The bound on the sums is shown in the module's
+// comment, so the additions and products do not need the overflow
+// check, which on a 32-bit core is a call per operation.
+@tier(embedded)
+@wrapping
+pub fn fe_mul(f: Fe, g: Fe) -> Fe
+    var h = fe_zero()
+    for i in 0..10
+        let fi = f.v[i]
+        let fi2 = fi * 2
+        for j in 0..10
+            let both_odd = (i & j & 1) == 1
+            let a = if both_odd then fi2 else fi
+            if i + j < 10
+                h.add_at(i + j, a * g.v[j])
+            else
+                h.add_at(i + j - 10, a * (g.v[j] * 19))
+    carry(h)
+
+@tier(embedded)
+pub fn fe_sq(f: Fe) -> Fe
+    fe_mul(f, f)
+
+// f raised to the power whose bits are 1 from bit `top` down to bit 8
+// and `low` below that, by squaring and multiplying from the top bit.
+// Both exponents the curve needs have that shape: p - 2 for the inverse
+// and (p - 5) / 8 for the square root.
+@tier(embedded)
+fn pow_ones(f: Fe, top: Int, low: Int) -> Fe
+    var r = fe_one()
+    for n in 0..(top + 1)
+        let i = top - n
+        r = fe_sq(r)
+        let bit = if i >= 8 then 1 else (low >> i) & 1
+        if bit == 1
+            r = fe_mul(r, f)
+    r
+
+// 1 / f, as f^(p - 2) (Fermat); 0 for f = 0.  p - 2 = 2^255 - 21 has
+// bits 254 to 8 set and 0xEB below.
+@tier(embedded)
+pub fn fe_invert(f: Fe) -> Fe
+    pow_ones(f, 254, 0xEB)
+
+// f^((p - 5) / 8), the power the square root of RFC 8032 § 5.1.3 takes.
+// (p - 5) / 8 = 2^252 - 3 has bits 251 to 8 set and 0xFD below.
+@tier(embedded)
+pub fn fe_pow2523(f: Fe) -> Fe
+    pow_ones(f, 251, 0xFD)
+
+// The canonical value of f, below p, as 32 little-endian bytes with the
+// top bit clear.  A third carry pass leaves every limb within its width,
+// so the value is below 2^255; it is at least p only when limbs 1 to 9
+// are full and limb 0 is at least 2^26 - 19, and then p is taken off.
+@tier(embedded)
+pub fn fe_to_bytes(f: Fe) -> B32
+    var h = carry(carry(f))
+    for i in 0..10
+        let w = width(i)
+        let c = h.v[i] >> w
+        h.put(i, h.v[i] & ((1 << w) - 1))
+        if i == 9
+            h.add_at(0, c * 19)
+        else
+            h.add_at(i + 1, c)
+    var full = h.v[0] >= (1 << 26) - 19
+    for i in 1..10
+        if h.v[i] != (1 << width(i)) - 1
+            full = false
+    // cov: skip — the body runs only for a result from p to 2^255 - 1 after the carries, about 1 in 2^250 of the values the check computes
+    if full
+        h.put(0, h.v[0] - ((1 << 26) - 19))
+        for i in 1..10
+            h.put(i, 0)
+    var out = b32_zero()
+    var acc = 0
+    var nbits = 0
+    var k = 0
+    for i in 0..10
+        acc = acc | (h.v[i] << nbits)
+        nbits = nbits + width(i)
+        // A limb adds at most 26 bits to at most 7 left over: up to four
+        // whole bytes.
+        for _b in 0..4
+            if nbits >= 8
+                out.put(k, acc & 255)
+                acc = acc >>> 8
+                nbits = nbits - 8
+                k = k + 1
+    out.put(31, acc & 255)
+    out
+
+// The element whose 32 little-endian bytes are `s`, the top bit
+// ignored.  A value from p to 2^255 - 1 is taken as it is, and reduced
+// by the arithmetic; a caller that must refuse one compares
+// `fe_to_bytes` of the result with the input.
+@tier(embedded)
+pub fn fe_from_bytes(s: B32) -> Fe
+    var h = fe_zero()
+    var acc = 0
+    var nbits = 0
+    var k = 0
+    for i in 0..10
+        let w = width(i)
+        // A limb of up to 26 bits takes at most four more bytes.
+        for _b in 0..4
+            if nbits < w
+                var byte = if k < 32 then s.at(k) else 0
+                if k == 31
+                    byte = byte & 127
+                acc = acc | (byte << nbits)
+                nbits = nbits + 8
+                k = k + 1
+        h.put(i, acc & ((1 << w) - 1))
+        acc = acc >>> w
+        nbits = nbits - w
+    h
+
+@tier(embedded)
+pub fn fe_eq(f: Fe, g: Fe) -> Bool
+    b32_eq(fe_to_bytes(f), fe_to_bytes(g))
+
+@tier(embedded)
+pub fn fe_is_zero(f: Fe) -> Bool
+    fe_eq(f, fe_zero())
+
+// The least significant bit of the canonical value: the sign RFC 8032
+// § 5.1.2 encodes for x.
+@tier(embedded)
+pub fn fe_is_odd(f: Fe) -> Bool
+    (fe_to_bytes(f).at(0) & 1) == 1
+
+// d = -121665 / 121666, the curve's constant, and 2d.
+@tier(embedded)
+pub fn fe_d() -> Fe
+    Fe { v: [0x35978a3, 0xd37284, 0x3156ebd, 0x6a0a0e, 0x1c029,
+             0x179e898, 0x3a03cbb, 0x1ce7198, 0x2e2b6ff, 0x1480db3] }
+
+@tier(embedded)
+pub fn fe_d2() -> Fe
+    Fe { v: [0x2b2f159, 0x1a6e509, 0x22add7a, 0xd4141d, 0x38052,
+             0xf3d130, 0x3407977, 0x19ce331, 0x1c56dff, 0x901b67] }
+
+// A square root of -1, 2^((p - 1) / 4).
+@tier(embedded)
+pub fn fe_sqrtm1() -> Fe
+    Fe { v: [0x20ea0b0, 0x186c9d2, 0x8f189d, 0x35697f, 0xbd0c60,
+             0x1fbd7a7, 0x2804c9e, 0x1e16569, 0x4fc1d, 0xae0c92] }

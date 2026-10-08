@@ -1,0 +1,325 @@
+// sha2.nv: the SHA-256 and SHA-512 compression functions (FIPS 180-4
+// § 6.2.2 and § 6.4.2), written as loops over a message schedule held
+// in an inline array, for a bootloader's flash.
+//
+// crypto-nv's `sha256_core` and `sha512_core` compute the same function
+// with the schedule and the rounds written out one by one, which is the
+// fastest form on a host.  On a Cortex-M the written-out SHA-512 is tens
+// of kilobytes of code, more than a bootloader's region holds, so the
+// device side here keeps the rounds in a loop: about a kilobyte for each
+// hash, at some speed.  The round constants are FIPS 180-4 § 4.2.2 and
+// § 4.2.3's, generated from the cube roots of the first primes they are
+// defined by and checked against the standard's table; a SHA-512
+// constant with its top bit set is written as the negative `Int` of the
+// same 64 bits.
+//
+// A SHA-256 word is kept in 0 to 2^32 - 1 by a mask after each sum, so
+// the sums never come near the overflow check.  A SHA-512 word is the
+// whole `Int`, and its sums are modular, so the SHA-512 functions are
+// `@wrapping` (SPEC § 13.2).  Nothing here allocates.
+
+// Sixteen words of a message block: 32-bit words for SHA-256, 64-bit
+// for SHA-512, read big-endian from the message.
+pub @value
+struct Blk
+    w: [Int; 16]
+
+impl Blk
+    @tier(embedded)
+    fn put(var self, i: Int, x: Int)
+        self.w[i] = x
+
+@tier(embedded)
+pub fn blk_zero() -> Blk
+    Blk { w: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] }
+
+// The eight chaining words of a hash's state.
+pub @value
+struct H8
+    h: [Int; 8]
+
+impl H8
+    @tier(embedded)
+    fn put(var self, i: Int, x: Int)
+        self.h[i] = x
+
+@value
+struct Sched
+    w: [Int; 80]
+
+impl Sched
+    @tier(embedded)
+    fn put(var self, i: Int, x: Int)
+        self.w[i] = x
+
+@tier(embedded)
+fn sched_zero() -> Sched
+    Sched { w: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] }
+
+@tier(embedded)
+fn rotr32(x: Int, n: Int) -> Int
+    ((x >>> n) | (x << (32 - n))) & 0xFFFFFFFF
+
+@tier(embedded)
+fn rotr64(x: Int, n: Int) -> Int
+    (x >>> n) | (x << (64 - n))
+
+@tier(embedded)
+pub fn sha256_init() -> H8
+    H8 { h: [0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A,
+             0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19] }
+
+@tier(embedded)
+pub fn sha512_init() -> H8
+    H8 { h: [0x6A09E667F3BCC908, -4942790177534073029, 0x3C6EF372FE94F82B,
+             -6534734903238641935, 0x510E527FADE682D1, -7276294671716946913,
+             0x1F83D9ABFB41BD6B, 0x5BE0CD19137E2179] }
+
+@tier(embedded)
+fn k256(t: Int) -> Int
+    match t
+        0 => 0x428A2F98
+        1 => 0x71374491
+        2 => 0xB5C0FBCF
+        3 => 0xE9B5DBA5
+        4 => 0x3956C25B
+        5 => 0x59F111F1
+        6 => 0x923F82A4
+        7 => 0xAB1C5ED5
+        8 => 0xD807AA98
+        9 => 0x12835B01
+        10 => 0x243185BE
+        11 => 0x550C7DC3
+        12 => 0x72BE5D74
+        13 => 0x80DEB1FE
+        14 => 0x9BDC06A7
+        15 => 0xC19BF174
+        16 => 0xE49B69C1
+        17 => 0xEFBE4786
+        18 => 0x0FC19DC6
+        19 => 0x240CA1CC
+        20 => 0x2DE92C6F
+        21 => 0x4A7484AA
+        22 => 0x5CB0A9DC
+        23 => 0x76F988DA
+        24 => 0x983E5152
+        25 => 0xA831C66D
+        26 => 0xB00327C8
+        27 => 0xBF597FC7
+        28 => 0xC6E00BF3
+        29 => 0xD5A79147
+        30 => 0x06CA6351
+        31 => 0x14292967
+        32 => 0x27B70A85
+        33 => 0x2E1B2138
+        34 => 0x4D2C6DFC
+        35 => 0x53380D13
+        36 => 0x650A7354
+        37 => 0x766A0ABB
+        38 => 0x81C2C92E
+        39 => 0x92722C85
+        40 => 0xA2BFE8A1
+        41 => 0xA81A664B
+        42 => 0xC24B8B70
+        43 => 0xC76C51A3
+        44 => 0xD192E819
+        45 => 0xD6990624
+        46 => 0xF40E3585
+        47 => 0x106AA070
+        48 => 0x19A4C116
+        49 => 0x1E376C08
+        50 => 0x2748774C
+        51 => 0x34B0BCB5
+        52 => 0x391C0CB3
+        53 => 0x4ED8AA4A
+        54 => 0x5B9CCA4F
+        55 => 0x682E6FF3
+        56 => 0x748F82EE
+        57 => 0x78A5636F
+        58 => 0x84C87814
+        59 => 0x8CC70208
+        60 => 0x90BEFFFA
+        61 => 0xA4506CEB
+        62 => 0xBEF9A3F7
+        _ => 0xC67178F2
+
+@tier(embedded)
+fn k512(t: Int) -> Int
+    match t
+        0 => 0x428A2F98D728AE22
+        1 => 0x7137449123EF65CD
+        2 => -5349999486874862801
+        3 => -1606136188198331460
+        4 => 0x3956C25BF348B538
+        5 => 0x59F111F1B605D019
+        6 => -7908458776815382629
+        7 => -6116909921290321640
+        8 => -2880145864133508542
+        9 => 0x12835B0145706FBE
+        10 => 0x243185BE4EE4B28C
+        11 => 0x550C7DC3D5FFB4E2
+        12 => 0x72BE5D74F27B896F
+        13 => -9160688886553864527
+        14 => -7215885187991268811
+        15 => -4495734319001033068
+        16 => -1973867731355612462
+        17 => -1171420211273849373
+        18 => 0x0FC19DC68B8CD5B5
+        19 => 0x240CA1CC77AC9C65
+        20 => 0x2DE92C6F592B0275
+        21 => 0x4A7484AA6EA6E483
+        22 => 0x5CB0A9DCBD41FBD4
+        23 => 0x76F988DA831153B5
+        24 => -7476448914759557205
+        25 => -6327057829258317296
+        26 => -5763719355590565569
+        27 => -4658551843659510044
+        28 => -4116276920077217854
+        29 => -3051310485924567259
+        30 => 0x06CA6351E003826F
+        31 => 0x142929670A0E6E70
+        32 => 0x27B70A8546D22FFC
+        33 => 0x2E1B21385C26C926
+        34 => 0x4D2C6DFC5AC42AED
+        35 => 0x53380D139D95B3DF
+        36 => 0x650A73548BAF63DE
+        37 => 0x766A0ABB3C77B2A8
+        38 => -9096487096722542874
+        39 => -7894198246740708037
+        40 => -6719396339535248540
+        41 => -6333637450476146687
+        42 => -4446306890439682159
+        43 => -4076793802049405392
+        44 => -3345356375505022440
+        45 => -2983346525034927856
+        46 => -860691631967231958
+        47 => 0x106AA07032BBD1B8
+        48 => 0x19A4C116B8D2D0C8
+        49 => 0x1E376C085141AB53
+        50 => 0x2748774CDF8EEB99
+        51 => 0x34B0BCB5E19B48A8
+        52 => 0x391C0CB3C5C95A63
+        53 => 0x4ED8AA4AE3418ACB
+        54 => 0x5B9CCA4F7763E373
+        55 => 0x682E6FF3D6B2B8A3
+        56 => 0x748F82EE5DEFB2FC
+        57 => 0x78A5636F43172F60
+        58 => -8878714635349349518
+        59 => -8302665154208450068
+        60 => -8016688836872298968
+        61 => -6606660893046293015
+        62 => -4685533653050689259
+        63 => -4147400797238176981
+        64 => -3880063495543823972
+        65 => -3348786107499101689
+        66 => -1523767162380948706
+        67 => -757361751448694408
+        68 => 0x06F067AA72176FBA
+        69 => 0x0A637DC5A2C898A6
+        70 => 0x113F9804BEF90DAE
+        71 => 0x1B710B35131C471B
+        72 => 0x28DB77F523047D84
+        73 => 0x32CAAB7B40C72493
+        74 => 0x3C9EBE0A15C9BEBC
+        75 => 0x431D67C49C100D4C
+        76 => 0x4CC5D4BECB3E42B6
+        77 => 0x597F299CFC657E2A
+        78 => 0x5FCB6FAB3AD6FAEC
+        _ => 0x6C44198C4A475817
+
+// One block into a SHA-256 state (FIPS 180-4 § 6.2.2).
+@tier(embedded)
+pub fn sha256_compress(st: H8, b: Blk) -> H8
+    var w = sched_zero()
+    for t in 0..16
+        w.put(t, b.w[t])
+    for t in 16..64
+        let x = w.w[t - 15]
+        let y = w.w[t - 2]
+        let s0 = rotr32(x, 7) ^ rotr32(x, 18) ^ (x >>> 3)
+        let s1 = rotr32(y, 17) ^ rotr32(y, 19) ^ (y >>> 10)
+        w.put(t, (w.w[t - 16] + s0 + w.w[t - 7] + s1) & 0xFFFFFFFF)
+    var a = st.h[0]
+    var bb = st.h[1]
+    var c = st.h[2]
+    var d = st.h[3]
+    var e = st.h[4]
+    var f = st.h[5]
+    var g = st.h[6]
+    var h = st.h[7]
+    for t in 0..64
+        let s1 = rotr32(e, 6) ^ rotr32(e, 11) ^ rotr32(e, 25)
+        let ch = (e & f) ^ ((e ^ 0xFFFFFFFF) & g)
+        let t1 = (h + s1 + ch + k256(t) + w.w[t]) & 0xFFFFFFFF
+        let s0 = rotr32(a, 2) ^ rotr32(a, 13) ^ rotr32(a, 22)
+        let maj = (a & bb) ^ (a & c) ^ (bb & c)
+        let t2 = (s0 + maj) & 0xFFFFFFFF
+        h = g
+        g = f
+        f = e
+        e = (d + t1) & 0xFFFFFFFF
+        d = c
+        c = bb
+        bb = a
+        a = (t1 + t2) & 0xFFFFFFFF
+    var out = st
+    out.put(0, (st.h[0] + a) & 0xFFFFFFFF)
+    out.put(1, (st.h[1] + bb) & 0xFFFFFFFF)
+    out.put(2, (st.h[2] + c) & 0xFFFFFFFF)
+    out.put(3, (st.h[3] + d) & 0xFFFFFFFF)
+    out.put(4, (st.h[4] + e) & 0xFFFFFFFF)
+    out.put(5, (st.h[5] + f) & 0xFFFFFFFF)
+    out.put(6, (st.h[6] + g) & 0xFFFFFFFF)
+    out.put(7, (st.h[7] + h) & 0xFFFFFFFF)
+    out
+
+// One block into a SHA-512 state (FIPS 180-4 § 6.4.2).
+@tier(embedded)
+@wrapping
+pub fn sha512_compress(st: H8, b: Blk) -> H8
+    var w = sched_zero()
+    for t in 0..16
+        w.put(t, b.w[t])
+    for t in 16..80
+        let x = w.w[t - 15]
+        let y = w.w[t - 2]
+        let s0 = rotr64(x, 1) ^ rotr64(x, 8) ^ (x >>> 7)
+        let s1 = rotr64(y, 19) ^ rotr64(y, 61) ^ (y >>> 6)
+        w.put(t, w.w[t - 16] + s0 + w.w[t - 7] + s1)
+    var a = st.h[0]
+    var bb = st.h[1]
+    var c = st.h[2]
+    var d = st.h[3]
+    var e = st.h[4]
+    var f = st.h[5]
+    var g = st.h[6]
+    var h = st.h[7]
+    for t in 0..80
+        let s1 = rotr64(e, 14) ^ rotr64(e, 18) ^ rotr64(e, 41)
+        let ch = (e & f) ^ (~e & g)
+        let t1 = h + s1 + ch + k512(t) + w.w[t]
+        let s0 = rotr64(a, 28) ^ rotr64(a, 34) ^ rotr64(a, 39)
+        let maj = (a & bb) ^ (a & c) ^ (bb & c)
+        let t2 = s0 + maj
+        h = g
+        g = f
+        f = e
+        e = d + t1
+        d = c
+        c = bb
+        bb = a
+        a = t1 + t2
+    var out = st
+    out.put(0, st.h[0] + a)
+    out.put(1, st.h[1] + bb)
+    out.put(2, st.h[2] + c)
+    out.put(3, st.h[3] + d)
+    out.put(4, st.h[4] + e)
+    out.put(5, st.h[5] + f)
+    out.put(6, st.h[6] + g)
+    out.put(7, st.h[7] + h)
+    out

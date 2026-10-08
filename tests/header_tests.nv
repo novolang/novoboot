@@ -1,0 +1,73 @@
+// header_tests: the bootloader's checks of slot images the toolchain
+// stamped, run on the host with the same code the device runs.
+//
+//   NOVOBOOT_IMGS=<dir> novo test tests/header_tests.nv
+//
+// tests/orbit/test_novoboot.sh builds the images for the
+// STM32F407G-DISC1 into <dir> with `--role=application`, unsigned
+// (unsigned.img) and signed with a key of the run's own (signed.img,
+// whose public key is in key.hex), and the variants of each a bench
+// writes.  Without the variable the tests check nothing.
+
+use std.test
+use std.bytes
+use bytes32
+use bootimg
+use hostsrc
+
+// The STM32F407G-DISC1's: its slots' size, its header size, the
+// STM32F405/407's identity word and the CRC-32C of the slug.
+let SLOT_BYTES = 0x40000
+let HEADER_BYTES = 512
+let CHIP = 0x413
+let BOARD = 0x96A06A37
+
+fn dir() -> Str [io]
+    env.get_or("NOVOBOOT_IMGS", "")
+
+fn load(name: Str) -> Bytes [io, fs]
+    fs.read_bytes("${dir()}/${name}") ?? bytes.zeros(0)
+
+fn key() -> B32 [io, fs]
+    let h = bytes.from_hex(str.trim(bytes.to_str(load("key.hex")))) ?? bytes.zeros(32)
+    var k = b32_zero()
+    for i in 0..32
+        k.put(i, bytes.byte_at(h, i) ?? 0)
+    k
+
+fn policy(required: Bool, with_key: Bool) -> Policy [io, fs]
+    Policy { header_bytes: HEADER_BYTES, chip: CHIP, board: BOARD, signing_required: required,
+             key_present: with_key, key: key() }
+
+fn check(name: Str, required: Bool, with_key: Bool) -> Str [io, fs]
+    bootimg.result_name(bootimg.check_slot(hostsrc.bytes_src(load(name)), SLOT_BYTES,
+                                           policy(required, with_key)))
+
+@test
+fn test_stamped_headers() [io, fs]
+    if dir() == ""
+        return
+    test.assert_eq_str(check("unsigned.img", false, true), "ok")
+    test.assert_eq_str(check("unsigned.img", true, true), "unsigned")
+    test.assert_eq_str(check("signed.img", true, true), "ok")
+    test.assert_eq_str(check("signed.img", true, false), "no key")
+    test.assert_eq_str(check("bit.img", false, true), "bad hash")
+    test.assert_eq_str(check("rehash.img", true, true), "bad signature")
+    test.assert_eq_str(check("big_s.img", true, true), "bad signature")
+    test.assert_eq_str(check("badhdr.img", false, true), "bad header crc")
+    test.assert_eq_str(check("chip.img", false, true), "wrong chip")
+    test.assert_eq_str(check("board.img", false, true), "wrong board")
+    test.assert_eq_str(check("version.img", false, true), "bad header")
+    test.assert_eq_str(check("size.img", false, true), "bad size")
+    test.assert_eq_str(check("empty.img", false, true), "empty")
+
+@test
+fn test_state_words() [io, fs]
+    if dir() == ""
+        return
+    let plain = hostsrc.bytes_src(load("unsigned.img"))
+    test.assert_false(bootimg.is_pending(plain), "a stamped image is not pending")
+    test.assert_false(bootimg.is_confirmed(plain), "nor confirmed")
+    test.assert_true(bootimg.is_pending(hostsrc.bytes_src(load("pending.img"))),
+                     "the bench's pending word reads as pending")
+    test.assert_eq(bootimg.version(plain), (1 << 24) | (2 << 16) | 3, "the version stamped, 1.2.3")

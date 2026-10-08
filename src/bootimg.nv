@@ -1,0 +1,202 @@
+// bootimg.nv: the image header at the start of a slot, and the checks
+// a bootloader makes before it starts the image after it.
+//
+// The layout, all words little-endian, is the toolchain's
+// (compiler/lib/flashtable.ml writes it; docs/embedded/bootloader.md
+// has the table):
+//
+//   0x00  magic, the bytes "NOVB"        0x14  chip id
+//   0x04  header version, 16 bits        0x18  board id
+//   0x06  header bytes, 16 bits          0x1C  flags, bit 0 unsigned
+//   0x08  image bytes                    0x20  SHA-256 of the image
+//   0x0C  major, minor (8 bits each)     0x40  Ed25519 signature
+//   0x0E  patch, 16 bits                 0x80  CRC-32C of 0x00 to 0x7F
+//   0x10  build id
+//   0xF0  pending, 0xF4 tried, 0xF8 confirmed: each a word that reads
+//         0xFFFFFFFF until it is written once, after the CRC because it
+//         changes after the image is written
+//
+// The image is the `image bytes` from `header bytes` into the slot: its
+// vector table first.  The checks run cheapest first, so an erased or
+// torn slot costs a few reads: the magic, the header's own CRC, the
+// version and sizes, the chip and the board, then the hash over the
+// whole image, then the signature over the header's first 0x40 bytes,
+// which hold the hash.
+
+use bytes32
+use imghash
+use ed25519
+use crc32
+
+pub const HEADER_MAGIC = 0x42564F4E
+pub const HEADER_VERSION = 1
+pub const OFF_PENDING = 0xF0
+pub const OFF_TRIED = 0xF4
+pub const OFF_CONFIRMED = 0xF8
+pub const STATE_PENDING = 0x444E4550
+pub const STATE_TRIED = 0x44595254
+pub const STATE_CONFIRMED = 0x464E4F43
+pub const FLAG_UNSIGNED = 1
+
+// What a check of a slot answers.
+pub const IMG_OK = 0
+// No header: the slot is erased, or holds something else.
+pub const IMG_EMPTY = 1
+// The header's CRC does not match: a torn or corrupt header.
+pub const IMG_BAD_CRC = 2
+// A header version, or a header size, this bootloader does not read.
+pub const IMG_BAD_HEADER = 3
+// The image does not fit in the slot after the header.
+pub const IMG_BAD_SIZE = 4
+// Built for another chip, or another board.
+pub const IMG_WRONG_CHIP = 5
+pub const IMG_WRONG_BOARD = 6
+// The image's bytes do not hash to the header's SHA-256.
+pub const IMG_BAD_HASH = 7
+// Unsigned where the board's manifest says `signing = "required"`.
+pub const IMG_UNSIGNED = 8
+// The signature does not verify under the bootloader's key, or the
+// bootloader carries no key to verify it with.
+pub const IMG_BAD_SIGNATURE = 9
+pub const IMG_NO_KEY = 10
+
+// What a bootloader checks an image against: the header size its table
+// gives, the chip's identity word and the board's id, the signing
+// policy, and the public key it carries.
+pub @value
+struct Policy
+    header_bytes: Int
+    chip: Int
+    board: Int
+    signing_required: Bool
+    key_present: Bool
+    key: B32
+
+@tier(embedded)
+fn u32_at<S: ByteSource[e]>(src: S, off: Int) -> Int [e]
+    src.src_at(off) | (src.src_at(off + 1) << 8) | (src.src_at(off + 2) << 16)
+        | (src.src_at(off + 3) << 24)
+
+@tier(embedded)
+fn u16_at<S: ByteSource[e]>(src: S, off: Int) -> Int [e]
+    src.src_at(off) | (src.src_at(off + 1) << 8)
+
+@tier(embedded)
+pub fn magic<S: ByteSource[e]>(slot: S) -> Int [e]
+    u32_at(slot, 0)
+
+@tier(embedded)
+pub fn image_bytes<S: ByteSource[e]>(slot: S) -> Int [e]
+    u32_at(slot, 0x08)
+
+@tier(embedded)
+pub fn header_bytes<S: ByteSource[e]>(slot: S) -> Int [e]
+    u16_at(slot, 0x06)
+
+@tier(embedded)
+pub fn flags<S: ByteSource[e]>(slot: S) -> Int [e]
+    u32_at(slot, 0x1C)
+
+// The image version as major << 24 | minor << 16 | patch.
+@tier(embedded)
+pub fn version<S: ByteSource[e]>(slot: S) -> Int [e]
+    (slot.src_at(0x0C) << 24) | (slot.src_at(0x0D) << 16) | u16_at(slot, 0x0E)
+
+@tier(embedded)
+pub fn is_pending<S: ByteSource[e]>(slot: S) -> Bool [e]
+    u32_at(slot, OFF_PENDING) == STATE_PENDING
+
+@tier(embedded)
+pub fn is_tried<S: ByteSource[e]>(slot: S) -> Bool [e]
+    u32_at(slot, OFF_TRIED) == STATE_TRIED
+
+@tier(embedded)
+pub fn is_confirmed<S: ByteSource[e]>(slot: S) -> Bool [e]
+    u32_at(slot, OFF_CONFIRMED) == STATE_CONFIRMED
+
+// The CRC-32C of the header's first 0x80 bytes, novofs's CRC.
+@tier(embedded)
+pub fn header_crc<S: ByteSource[e]>(slot: S) -> Int [e]
+    var c = 0xFFFFFFFF
+    for i in 0..0x80
+        c = crc32.update(c, slot.src_at(i))
+    c ^ 0xFFFFFFFF
+
+// Every check but the hash and the signature: the magic, the CRC, the
+// version and sizes, the chip and the board.  `slot_bytes` is the
+// slot's length.
+@tier(embedded)
+pub fn check_header<S: ByteSource[e]>(slot: S, slot_bytes: Int, pol: Policy) -> Int [e]
+    if magic(slot) != HEADER_MAGIC
+        return IMG_EMPTY
+    if header_crc(slot) != u32_at(slot, 0x80)
+        return IMG_BAD_CRC
+    if u16_at(slot, 0x04) != HEADER_VERSION or header_bytes(slot) != pol.header_bytes
+        return IMG_BAD_HEADER
+    let n = image_bytes(slot)
+    if n <= 0 or n > slot_bytes - pol.header_bytes
+        return IMG_BAD_SIZE
+    if u32_at(slot, 0x14) != pol.chip
+        return IMG_WRONG_CHIP
+    if u32_at(slot, 0x18) != pol.board
+        return IMG_WRONG_BOARD
+    IMG_OK
+
+// The SHA-256 of the slot's image, as the header gives its length.
+@tier(embedded)
+pub fn image_hash<S: ByteSource[e]>(slot: S) -> B32 [e]
+    imghash.sha256_of(slot.src_window(header_bytes(slot), image_bytes(slot)))
+
+// Whether the header's SHA-256 is the image's.
+@tier(embedded)
+pub fn check_hash<S: ByteSource[e]>(slot: S) -> Bool [e]
+    let h = image_hash(slot)
+    var diff = 0
+    for i in 0..32
+        diff = diff | (h.at(i) ^ slot.src_at(0x20 + i))
+    diff == 0
+
+// The signature policy: an unsigned image passes where signing is
+// optional and is refused where it is required; a signed one passes
+// when its signature over the header's first 0x40 bytes verifies under
+// the bootloader's key.
+@tier(embedded)
+pub fn check_signature<S: ByteSource[e]>(slot: S, pol: Policy) -> Int [e]
+    if (flags(slot) & FLAG_UNSIGNED) != 0
+        if pol.signing_required
+            return IMG_UNSIGNED
+        return IMG_OK
+    if not pol.key_present
+        return IMG_NO_KEY
+    var sig = b64_zero()
+    for i in 0..64
+        sig.put(i, slot.src_at(0x40 + i))
+    if ed25519.verify(pol.key, sig, slot.src_window(0, 0x40))
+        return IMG_OK
+    IMG_BAD_SIGNATURE
+
+// The whole check of a slot, cheapest first.
+@tier(embedded)
+pub fn check_slot<S: ByteSource[e]>(slot: S, slot_bytes: Int, pol: Policy) -> Int [e]
+    let h = check_header(slot, slot_bytes, pol)
+    if h != IMG_OK
+        return h
+    if not check_hash(slot)
+        return IMG_BAD_HASH
+    check_signature(slot, pol)
+
+// The name of a check's answer, for a log line.
+@tier(embedded)
+pub fn result_name(r: Int) -> Str
+    match r
+        0 => "ok"
+        1 => "empty"
+        2 => "bad header crc"
+        3 => "bad header"
+        4 => "bad size"
+        5 => "wrong chip"
+        6 => "wrong board"
+        7 => "bad hash"
+        8 => "unsigned"
+        9 => "bad signature"
+        _ => "no key"
