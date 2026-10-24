@@ -68,10 +68,10 @@ pub fn ge_base() -> Ge
 // T = EH.
 @tier(embedded)
 fn ge_finish(var r: Ge, var e: Fe, var f: Fe, var g: Fe, var h: Fe)
-    fe_mul(r.x, e, f)
-    fe_mul(r.y, g, h)
-    fe_mul(r.z, f, g)
-    fe_mul(r.t, e, h)
+    fe_mul(var r.x, var e, var f)
+    fe_mul(var r.y, var g, var h)
+    fe_mul(var r.z, var f, var g)
+    fe_mul(var r.t, var e, var h)
 
 // r = P + Q, "add-2008-hwcd-3" for a = -1 (RFC 8032 § 5.1.4).  r may
 // be P or Q: every coordinate of both is read before r is written.
@@ -82,26 +82,26 @@ pub fn ge_add(var r: Ge, var p: Ge, var q: Ge)
     var c = fe_zero()
     var d = fe_zero()
     var u = fe_zero()
-    fe_sub(a, p.y, p.x)
-    fe_sub(u, q.y, q.x)
-    fe_mul(a, a, u)
-    fe_add(b, p.y, p.x)
-    fe_add(u, q.y, q.x)
-    fe_mul(b, b, u)
+    fe_sub(var a, var p.y, var p.x)
+    fe_sub(var u, var q.y, var q.x)
+    fe_mul(var a, var a, var u)
+    fe_add(var b, var p.y, var p.x)
+    fe_add(var u, var q.y, var q.x)
+    fe_mul(var b, var b, var u)
     var d2 = fe_d2()
-    fe_mul(c, p.t, d2)
-    fe_mul(c, c, q.t)
-    fe_add(d, p.z, p.z)
-    fe_mul(d, d, q.z)
+    fe_mul(var c, var p.t, var d2)
+    fe_mul(var c, var c, var q.t)
+    fe_add(var d, var p.z, var p.z)
+    fe_mul(var d, var d, var q.z)
     var e = fe_zero()
     var f = fe_zero()
     var g = fe_zero()
     var h = fe_zero()
-    fe_sub(e, b, a)
-    fe_sub(f, d, c)
-    fe_add(g, d, c)
-    fe_add(h, b, a)
-    ge_finish(r, e, f, g, h)
+    fe_sub(var e, var b, var a)
+    fe_sub(var f, var d, var c)
+    fe_add(var g, var d, var c)
+    fe_add(var h, var b, var a)
+    ge_finish(var r, var e, var f, var g, var h)
 
 // r = 2P, "dbl-2008-hwcd" for a = -1, with every intermediate negated,
 // which leaves the products as they are and saves the negation of x^2.
@@ -112,42 +112,42 @@ pub fn ge_dbl(var r: Ge, var p: Ge)
     var b = fe_zero()
     var c = fe_zero()
     var u = fe_zero()
-    fe_sq(a, p.x)
-    fe_sq(b, p.y)
-    fe_sq(c, p.z)
-    fe_add(c, c, c)
+    fe_sq(var a, var p.x)
+    fe_sq(var b, var p.y)
+    fe_sq(var c, var p.z)
+    fe_add(var c, var c, var c)
     var h = fe_zero()
-    fe_add(h, a, b)
-    fe_add(u, p.x, p.y)
-    fe_sq(u, u)
+    fe_add(var h, var a, var b)
+    fe_add(var u, var p.x, var p.y)
+    fe_sq(var u, var u)
     var e = fe_zero()
-    fe_sub(e, h, u)
+    fe_sub(var e, var h, var u)
     var g = fe_zero()
-    fe_sub(g, a, b)
+    fe_sub(var g, var a, var b)
     var f = fe_zero()
-    fe_add(f, c, g)
-    ge_finish(r, e, f, g, h)
+    fe_add(var f, var c, var g)
+    ge_finish(var r, var e, var f, var g, var h)
 
 // r = -P.
 @tier(embedded)
 pub fn ge_neg(var r: Ge, var p: Ge)
-    fe_neg(r.x, p.x)
+    fe_neg(var r.x, var p.x)
     r.y = p.y
     r.z = p.z
-    fe_neg(r.t, p.t)
+    fe_neg(var r.t, var p.t)
 
 // The 32-byte encoding of P, written into `out`: y, with x's least
 // significant bit in the top bit (RFC 8032 § 5.1.2).
 @tier(embedded)
 pub fn ge_encode(var out: B32, var p: Ge)
     var zi = fe_zero()
-    fe_invert(zi, p.z)
+    fe_invert(var zi, var p.z)
     var x = fe_zero()
     var y = fe_zero()
-    fe_mul(x, p.x, zi)
-    fe_mul(y, p.y, zi)
-    fe_to_bytes(out, y)
-    out.b[31] = out.b[31] | ((if fe_is_odd(x) then 128 else 0) as u8)
+    fe_mul(var x, var p.x, var zi)
+    fe_mul(var y, var p.y, var zi)
+    fe_to_bytes(var out, var y)
+    out.b[31] = out.b[31] | ((if fe_is_odd(var x) then 128 else 0) as u8)
 
 // The point a 32-byte encoding names (RFC 8032 § 5.1.3), written into
 // `r`; false, with `r` left as it was, when y is not below p, when x^2
@@ -156,10 +156,10 @@ pub fn ge_encode(var out: B32, var p: Ge)
 pub fn ge_decode(var r: Ge, var s: B32) -> Bool
     let sign = ((s.b[31] as Int) >> 7) & 1
     var y = fe_zero()
-    fe_from_bytes(y, s)
+    fe_from_bytes(var y, var s)
     // Canonical: the bytes of y below p are the input's, top bit aside.
     var back = b32_zero()
-    fe_to_bytes(back, y)
+    fe_to_bytes(var back, var y)
     var same = true
     for i in 0..32
         let want = if i == 31 then (s.b[31] as Int) & 127 else s.b[i] as Int
@@ -169,45 +169,45 @@ pub fn ge_decode(var r: Ge, var s: B32) -> Bool
         return false
     var one = fe_one()
     var u = fe_zero()
-    fe_sq(u, y)
+    fe_sq(var u, var y)
     var v = fe_d()
-    fe_mul(v, v, u)
-    fe_add(v, v, one)
-    fe_sub(u, u, one)
+    fe_mul(var v, var v, var u)
+    fe_add(var v, var v, var one)
+    fe_sub(var u, var u, var one)
     // x = u v^3 (u v^7)^((p - 5) / 8)
     var v3 = fe_zero()
-    fe_sq(v3, v)
-    fe_mul(v3, v3, v)
+    fe_sq(var v3, var v)
+    fe_mul(var v3, var v3, var v)
     var t = fe_zero()
-    fe_sq(t, v3)
-    fe_mul(t, t, v)
-    fe_mul(t, t, u)
-    fe_pow2523(t, t)
+    fe_sq(var t, var v3)
+    fe_mul(var t, var t, var v)
+    fe_mul(var t, var t, var u)
+    fe_pow2523(var t, var t)
     var x = fe_zero()
-    fe_mul(x, u, v3)
-    fe_mul(x, x, t)
+    fe_mul(var x, var u, var v3)
+    fe_mul(var x, var x, var t)
     // v x^2 is u when x is the root, -u when x times sqrt(-1) is; neither
     // when u / v has no square root and the bytes name no point.
     var vxx = fe_zero()
-    fe_sq(vxx, x)
-    fe_mul(vxx, vxx, v)
-    let root = fe_eq(vxx, u)
-    fe_neg(t, u)
-    if not root and not fe_eq(vxx, t)
+    fe_sq(var vxx, var x)
+    fe_mul(var vxx, var vxx, var v)
+    let root = fe_eq(var vxx, var u)
+    fe_neg(var t, var u)
+    if not root and not fe_eq(var vxx, var t)
         // cov: skip — runs only for a key that is not a curve point; the bootloader's key is the build's public key, a point by construction
         return false
     if not root
         var m = fe_sqrtm1()
-        fe_mul(x, x, m)
-    if fe_is_zero(x) and sign == 1
+        fe_mul(var x, var x, var m)
+    if fe_is_zero(var x) and sign == 1
         // cov: skip — runs only for the encoding of x = 0 with the sign bit set, which no public key is
         return false
-    if (if fe_is_odd(x) then 1 else 0) != sign
-        fe_neg(x, x)
+    if (if fe_is_odd(var x) then 1 else 0) != sign
+        fe_neg(var x, var x)
     r.x = x
     r.y = y
     r.z = one
-    fe_mul(r.t, x, y)
+    fe_mul(var r.t, var x, var y)
     true
 
 // ── Scalars modulo L ─────────────────────────────────────────────────
@@ -277,9 +277,9 @@ pub fn sc_reduce64(var out: B32, var h: B64)
     var r = sc_zero()
     for n in 0..512
         let i = 511 - n
-        sc_shl1(r, ((h.b[i >> 3] as Int) >> (i & 7)) & 1)
-        if sc_ge_l(r)
-            sc_sub_l(r)
+        sc_shl1(var r, ((h.b[i >> 3] as Int) >> (i & 7)) & 1)
+        if sc_ge_l(var r)
+            sc_sub_l(var r)
     for k in 0..8
         for j in 0..4
             out.b[4 * k + j] = ((r.w[k] >> (8 * j)) & 255) as u8
@@ -291,7 +291,7 @@ pub fn sc_below_l(var s: B32) -> Bool
     for k in 0..8
         w.put(k, (s.b[4 * k] as Int) | ((s.b[4 * k + 1] as Int) << 8)
                  | ((s.b[4 * k + 2] as Int) << 16) | ((s.b[4 * k + 3] as Int) << 24))
-    not sc_ge_l(w)
+    not sc_ge_l(var w)
 
 @tier(embedded)
 fn bit_of(var s: B32, i: Int) -> Int
@@ -304,19 +304,19 @@ fn bit_of(var s: B32, i: Int) -> Int
 pub fn double_scalar_mul(var acc: Ge, var s: B32, var k: B32, var p: Ge)
     var b = ge_base()
     var bp = ge_identity()
-    ge_add(bp, b, p)
+    ge_add(var bp, var b, var p)
     acc = ge_identity()
     for n in 0..253
         let i = 252 - n
-        ge_dbl(acc, acc)
-        let sb = bit_of(s, i)
-        let kb = bit_of(k, i)
+        ge_dbl(var acc, var acc)
+        let sb = bit_of(var s, i)
+        let kb = bit_of(var k, i)
         if sb == 1 and kb == 1
-            ge_add(acc, acc, bp)
+            ge_add(var acc, var acc, var bp)
         else if sb == 1
-            ge_add(acc, acc, b)
+            ge_add(var acc, var acc, var b)
         else if kb == 1
-            ge_add(acc, acc, p)
+            ge_add(var acc, var acc, var p)
 
 // ── SHA-512 over R || A || M ─────────────────────────────────────────
 
@@ -349,7 +349,7 @@ fn ram_block<S: ByteSource[e]>(var blk: Blk, var r: B32, var a: B32, msg: S, bas
             w = total * 8
         else
             for j in 0..8
-                w = (w << 8) | ram_at(r, a, msg, off + j, total)
+                w = (w << 8) | ram_at(var r, var a, msg, off + j, total)
         blk.w[k] = w
 
 // SHA-512(R || A || M), as 64 bytes written into `out`.
@@ -360,8 +360,8 @@ pub fn sha512_ram<S: ByteSource[e]>(var out: B64, var r: B32, var a: B32, msg: S
     var st = sha2.sha512_init()
     var blk = blk_zero()
     for n in 0..(padded / 128)
-        ram_block(blk, r, a, msg, n * 128, total, padded)
-        sha2.sha512_compress(st, blk)
+        ram_block(var blk, var r, var a, msg, n * 128, total, padded)
+        sha2.sha512_compress(var st, var blk)
     for i in 0..8
         out.put_be64(8 * i, st.h[i])
 
@@ -375,21 +375,21 @@ pub fn verify<S: ByteSource[e]>(pk: B32, sig: B64, msg: S) -> Bool [e]
     var sg = sig
     var r = b32_zero()
     var s = b32_zero()
-    sg.half_into(r, false)
-    sg.half_into(s, true)
-    if not sc_below_l(s)
+    sg.half_into(var r, false)
+    sg.half_into(var s, true)
+    if not sc_below_l(var s)
         return false
     var a = ge_identity()
-    if not ge_decode(a, key)
+    if not ge_decode(var a, var key)
         // cov: skip — runs only for a key that does not decode, which the bootloader's built-in key always does
         return false
-    ge_neg(a, a)
+    ge_neg(var a, var a)
     var h = b64_zero()
-    sha512_ram(h, r, key, msg)
+    sha512_ram(var h, var r, var key, msg)
     var k = b32_zero()
-    sc_reduce64(k, h)
+    sc_reduce64(var k, var h)
     var acc = ge_identity()
-    double_scalar_mul(acc, s, k, a)
+    double_scalar_mul(var acc, var s, var k, var a)
     var enc = b32_zero()
-    ge_encode(enc, acc)
-    b32_eq(enc, r)
+    ge_encode(var enc, var acc)
+    b32_eq(var enc, var r)

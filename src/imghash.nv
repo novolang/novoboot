@@ -47,8 +47,8 @@ pub fn sha256_of<S: ByteSource[e]>(src: S) -> B32 [e]
     var st = sha2.sha256_init()
     var blk = blk_zero()
     for n in 0..(padded / 64)
-        block_at(blk, src, n * 64, total, padded)
-        sha2.sha256_compress(st, blk)
+        block_at(var blk, src, n * 64, total, padded)
+        sha2.sha256_compress(var st, var blk)
     var out = b32_zero()
     for i in 0..8
         out.put_be32(4 * i, st.h[i])
