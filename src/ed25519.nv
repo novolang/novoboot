@@ -84,15 +84,20 @@ pub fn ge_add(var r: Ge, var p: Ge, var q: Ge)
     var u = fe25519.fe_zero()
     fe25519.fe_sub(var a, var p.y, var p.x)
     fe25519.fe_sub(var u, var q.y, var q.x)
-    fe25519.fe_mul(var a, var a, var u)
+    var c23_a = a
+    fe25519.fe_mul(var a, var c23_a, var u)
     fe25519.fe_add(var b, var p.y, var p.x)
     fe25519.fe_add(var u, var q.y, var q.x)
-    fe25519.fe_mul(var b, var b, var u)
+    var c22_b = b
+    fe25519.fe_mul(var b, var c22_b, var u)
     var d2 = fe25519.fe_d2()
     fe25519.fe_mul(var c, var p.t, var d2)
-    fe25519.fe_mul(var c, var c, var q.t)
-    fe25519.fe_add(var d, var p.z, var p.z)
-    fe25519.fe_mul(var d, var d, var q.z)
+    var c21_c = c
+    fe25519.fe_mul(var c, var c21_c, var q.t)
+    var c20_p_z = p.z
+    fe25519.fe_add(var d, var p.z, var c20_p_z)
+    var c19_d = d
+    fe25519.fe_mul(var d, var c19_d, var q.z)
     var e = fe25519.fe_zero()
     var f = fe25519.fe_zero()
     var g = fe25519.fe_zero()
@@ -115,11 +120,14 @@ pub fn ge_dbl(var r: Ge, var p: Ge)
     fe25519.fe_sq(var a, var p.x)
     fe25519.fe_sq(var b, var p.y)
     fe25519.fe_sq(var c, var p.z)
-    fe25519.fe_add(var c, var c, var c)
+    var c17_c = c
+    var c18_c = c
+    fe25519.fe_add(var c, var c17_c, var c18_c)
     var h = fe25519.fe_zero()
     fe25519.fe_add(var h, var a, var b)
     fe25519.fe_add(var u, var p.x, var p.y)
-    fe25519.fe_sq(var u, var u)
+    var c16_u = u
+    fe25519.fe_sq(var u, var c16_u)
     var e = fe25519.fe_zero()
     fe25519.fe_sub(var e, var h, var u)
     var g = fe25519.fe_zero()
@@ -171,26 +179,35 @@ pub fn ge_decode(var r: Ge, var s: B32) -> Bool
     var u = fe25519.fe_zero()
     fe25519.fe_sq(var u, var y)
     var v = fe25519.fe_d()
-    fe25519.fe_mul(var v, var v, var u)
-    fe25519.fe_add(var v, var v, var one)
-    fe25519.fe_sub(var u, var u, var one)
+    var c15_v = v
+    fe25519.fe_mul(var v, var c15_v, var u)
+    var c14_v = v
+    fe25519.fe_add(var v, var c14_v, var one)
+    var c13_u = u
+    fe25519.fe_sub(var u, var c13_u, var one)
     // x = u v^3 (u v^7)^((p - 5) / 8)
     var v3 = fe25519.fe_zero()
     fe25519.fe_sq(var v3, var v)
-    fe25519.fe_mul(var v3, var v3, var v)
+    var c12_v3 = v3
+    fe25519.fe_mul(var v3, var c12_v3, var v)
     var t = fe25519.fe_zero()
     fe25519.fe_sq(var t, var v3)
-    fe25519.fe_mul(var t, var t, var v)
-    fe25519.fe_mul(var t, var t, var u)
-    fe25519.fe_pow2523(var t, var t)
+    var c11_t = t
+    fe25519.fe_mul(var t, var c11_t, var v)
+    var c10_t = t
+    fe25519.fe_mul(var t, var c10_t, var u)
+    var c9_t = t
+    fe25519.fe_pow2523(var t, var c9_t)
     var x = fe25519.fe_zero()
     fe25519.fe_mul(var x, var u, var v3)
-    fe25519.fe_mul(var x, var x, var t)
+    var c8_x = x
+    fe25519.fe_mul(var x, var c8_x, var t)
     // v x^2 is u when x is the root, -u when x times sqrt(-1) is; neither
     // when u / v has no square root and the bytes name no point.
     var vxx = fe25519.fe_zero()
     fe25519.fe_sq(var vxx, var x)
-    fe25519.fe_mul(var vxx, var vxx, var v)
+    var c7_vxx = vxx
+    fe25519.fe_mul(var vxx, var c7_vxx, var v)
     let root = fe25519.fe_eq(var vxx, var u)
     fe25519.fe_neg(var t, var u)
     if not root and not fe25519.fe_eq(var vxx, var t)
@@ -198,12 +215,14 @@ pub fn ge_decode(var r: Ge, var s: B32) -> Bool
         return false
     if not root
         var m = fe25519.fe_sqrtm1()
-        fe25519.fe_mul(var x, var x, var m)
+        var c6_x = x
+        fe25519.fe_mul(var x, var c6_x, var m)
     if fe25519.fe_is_zero(var x) and sign == 1
         // cov: skip — runs only for the encoding of x = 0 with the sign bit set, which no public key is
         return false
     if (if fe25519.fe_is_odd(var x) then 1 else 0) != sign
-        fe25519.fe_neg(var x, var x)
+        var c5_x = x
+        fe25519.fe_neg(var x, var c5_x)
     r.x = x
     r.y = y
     r.z = one
@@ -308,15 +327,19 @@ pub fn double_scalar_mul(var acc: Ge, var s: B32, var k: B32, var p: Ge)
     acc = ge_identity()
     for n in 0..253
         let i = 252 - n
-        ge_dbl(var acc, var acc)
+        var c4_acc = acc
+        ge_dbl(var acc, var c4_acc)
         let sb = bit_of(var s, i)
         let kb = bit_of(var k, i)
         if sb == 1 and kb == 1
-            ge_add(var acc, var acc, var bp)
+            var c3_acc = acc
+            ge_add(var acc, var c3_acc, var bp)
         else if sb == 1
-            ge_add(var acc, var acc, var b)
+            var c2_acc = acc
+            ge_add(var acc, var c2_acc, var b)
         else if kb == 1
-            ge_add(var acc, var acc, var p)
+            var c1_acc = acc
+            ge_add(var acc, var c1_acc, var p)
 
 // ── SHA-512 over R || A || M ─────────────────────────────────────────
 
@@ -383,7 +406,8 @@ pub fn verify<S: ByteSource[e]>(pk: B32, sig: B64, msg: S) -> Bool [e]
     if not ge_decode(var a, var key)
         // cov: skip — runs only for a key that does not decode, which the bootloader's built-in key always does
         return false
-    ge_neg(var a, var a)
+    var c0_a = a
+    ge_neg(var a, var c0_a)
     var h = bytes32.b64_zero()
     sha512_ram(var h, var r, var key, msg)
     var k = bytes32.b32_zero()

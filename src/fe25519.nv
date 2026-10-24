@@ -121,7 +121,8 @@ pub fn fe_mul(var h: Fe, var f: Fe, var g: Fe)
 // h = f^2.
 @tier(embedded)
 pub fn fe_sq(var h: Fe, var f: Fe)
-    fe_mul(var h, var f, var f)
+    var c26_f = f
+    fe_mul(var h, var f, var c26_f)
 
 // h = f raised to the power whose bits are 1 from bit `top` down to bit
 // 8 and `low` below that, by squaring and multiplying from the top bit.
@@ -132,10 +133,12 @@ fn pow_ones(var h: Fe, var f: Fe, top: Int, low: Int)
     var r = fe_one()
     for n in 0..(top + 1)
         let i = top - n
-        fe_sq(var r, var r)
+        var c25_r = r
+        fe_sq(var r, var c25_r)
         let bit = if i >= 8 then 1 else (low >> i) & 1
         if bit == 1
-            fe_mul(var r, var r, var f)
+            var c24_r = r
+            fe_mul(var r, var c24_r, var f)
     h = r
 
 // h = 1 / f, as f^(p - 2) (Fermat); 0 for f = 0.  p - 2 = 2^255 - 21 has
