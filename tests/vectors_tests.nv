@@ -20,13 +20,13 @@ fn hexb(h: Str) -> Bytes
     bytes.from_hex(h) ?? bytes.zeros(0)
 
 fn to32(b: Bytes) -> B32
-    var out = b32_zero()
+    var out = bytes32.b32_zero()
     for i in 0..32
         out.put(i, (bytes.byte_at(b, i) ?? 0))
     out
 
 fn to64(b: Bytes) -> B64
-    var out = b64_zero()
+    var out = bytes32.b64_zero()
     for i in 0..64
         out.put(i, (bytes.byte_at(b, i) ?? 0))
     out

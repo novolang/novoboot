@@ -212,11 +212,11 @@ pub fn fe_from_bytes(var h: Fe, var s: B32)
 
 @tier(embedded)
 pub fn fe_eq(var f: Fe, var g: Fe) -> Bool
-    var a = b32_zero()
-    var b = b32_zero()
+    var a = bytes32.b32_zero()
+    var b = bytes32.b32_zero()
     fe_to_bytes(var a, var f)
     fe_to_bytes(var b, var g)
-    b32_eq(var a, var b)
+    bytes32.b32_eq(var a, var b)
 
 @tier(embedded)
 pub fn fe_is_zero(var f: Fe) -> Bool
@@ -227,7 +227,7 @@ pub fn fe_is_zero(var f: Fe) -> Bool
 // § 5.1.2 encodes for x.
 @tier(embedded)
 pub fn fe_is_odd(var f: Fe) -> Bool
-    var b = b32_zero()
+    var b = bytes32.b32_zero()
     fe_to_bytes(var b, var f)
     (b.b[0] & 1) == 1
 

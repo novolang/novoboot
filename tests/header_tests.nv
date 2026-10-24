@@ -30,7 +30,7 @@ fn load(name: Str) -> Bytes [io, fs]
 
 fn key() -> B32 [io, fs]
     let h = bytes.from_hex(str.trim(bytes.to_str(load("key.hex")))) ?? bytes.zeros(32)
-    var k = b32_zero()
+    var k = bytes32.b32_zero()
     for i in 0..32
         k.put(i, bytes.byte_at(h, i) ?? 0)
     k

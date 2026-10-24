@@ -45,11 +45,11 @@ pub fn sha256_of<S: ByteSource[e]>(src: S) -> B32 [e]
     let total = src.src_len()
     let padded = (total + 9 + 63) / 64 * 64
     var st = sha2.sha256_init()
-    var blk = blk_zero()
+    var blk = sha2.blk_zero()
     for n in 0..(padded / 64)
         block_at(var blk, src, n * 64, total, padded)
         sha2.sha256_compress(var st, var blk)
-    var out = b32_zero()
+    var out = bytes32.b32_zero()
     for i in 0..8
         out.put_be32(4 * i, st.h[i])
     out

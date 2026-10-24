@@ -168,7 +168,7 @@ pub fn check_signature<S: ByteSource[e]>(slot: S, pol: Policy) -> Int [e]
         return IMG_OK
     if not pol.key_present
         return IMG_NO_KEY
-    var sig = b64_zero()
+    var sig = bytes32.b64_zero()
     for i in 0..64
         sig.put(i, slot.src_at(0x40 + i))
     if ed25519.verify(pol.key, sig, slot.src_window(0, 0x40))
