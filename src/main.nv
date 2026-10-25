@@ -91,7 +91,7 @@ fn key_word(w: Int) -> Int [hw]
         _ => bsp.board.flash_key_7()
 
 fn key() -> B32 [hw]
-    var k = b32_zero()
+    var k = bytes32.b32_zero()
     for w in 0..8
         for j in 0..4
             k.put(4 * w + j, (key_word(w) >> (8 * j)) & 255)
