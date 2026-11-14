@@ -48,6 +48,8 @@
 #      on trial under the watchdog, never confirmed; the watchdog resets
 #      the board and the next boot reverts it: slot A is app1 again, and
 #      slot B holds app2 marked tried, which is never tried again;
+#   2b. app1 in slot A carrying its three state words and app4 pending in slot B: the swap puts app1 into slot B with
+#      its three state words erased, and a plain reset after app4 confirms itself swaps nothing;
 #   3. a swap of app4 into slot A cut by a reset of the core at each
 #      point of each step (after the step's word is written, after its
 #      destination is erased, after half its copy), after the record's
@@ -418,7 +420,7 @@ expect "confirmed after=0"                         "and does not confirm itself,
 boot "$WORK/boot.elf" s3b wait
 expect "reset reason=3"                            "the watchdog resets the board: the next boot reads reason 3"
 expect "rule: revert"                              "the rule reverts the trial"
-expect "slot a: ok v1.0.0 unsigned confirmed"      "slot A holds app1 again, confirmed"
+expect "slot a: ok v1.0.0 unsigned"                "slot A holds app1 again, with no mark: it left slot A with none"
 run_app "$WORK/app1.elf" "app running" s3bapp
 expect "app app1"                                  "and app1 runs"
 w=$(word "0x$SLOT_B + 0xF0"); t=$(word "0x$SLOT_B + 0xF4"); c=$(word "0x$SLOT_B + 0xF8")
@@ -454,6 +456,35 @@ if grep -q "^watchdog started" <<< "$OUT"; then
 else
   pass "and not under the watchdog, so it runs"
 fi
+put "$WORK/app1.img" "$SLOT_A"
+
+# ── 3b. the marks of the image that leaves slot A ────────────────────────────
+echo ""
+echo "3b. the image that leaves slot A arrives in slot B with no marks"
+# app1 in slot A carries all three marks, as an update that was tried and confirmed does (a boot between the two writes below leaves it as it
+# is), app4, which confirms itself, waits pending in slot B.  The swap puts app1 into slot B; its marks of the time it ran in slot A would read
+# as a request to start it again, so its three state words are erased.  After app4 confirms, a plain reset starts it where it is and swaps nothing.
+python3 "$TOOL" mark "$WORK/app1.img" "$WORK/app1_marked.img" pending tried confirmed
+python3 "$TOOL" pend "$WORK/app4.img" "$WORK/app4_pend.img"
+put "$WORK/app1_marked.img" "$SLOT_A"
+put "$WORK/app4_pend.img" "$SLOT_B"
+boot "$WORK/boot.elf" s3g
+expect "slot a: ok v1.0.0 unsigned pending tried confirmed" "slot A holds app1 with its three marks"
+expect "slot b: ok v2.0.0 unsigned pending"        "slot B holds app4, pending"
+expect "rule: swap, trial a"                       "the rule swaps app4 in"
+expect "slot a: ok v2.0.0 unsigned pending"        "slot A holds app4 after the swap"
+w=$(word "0x$SLOT_B + 0xF0"); t=$(word "0x$SLOT_B + 0xF4"); c=$(word "0x$SLOT_B + 0xF8")
+if [ "$w" = "ffffffff" ] && [ "$t" = "ffffffff" ] && [ "$c" = "ffffffff" ]; then
+  pass "slot B holds app1 with its pending, tried and confirmed words erased"
+else
+  fail "slot B's state words read $w $t $c after the swap"
+fi
+run_app "$WORK/app4.elf" "app running" s3gapp
+expect "confirmed after=1"                         "app4 runs and confirms itself"
+boot "$WORK/boot.elf" s3h
+expect "slot a: ok v2.0.0 unsigned pending tried confirmed" "slot A is app4, confirmed"
+expect "slot b: ok v1.0.0 unsigned"                "slot B is app1 with no mark"
+expect "rule: boot a"                              "a plain reset swaps nothing"
 put "$WORK/app1.img" "$SLOT_A"
 
 # ── 4. a reset at every step of a swap ────────────────────────────────────

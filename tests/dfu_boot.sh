@@ -294,8 +294,8 @@ else
   fail "slot A's tried and confirmed words read ${t:-nothing} ${c:-nothing}"
 fi
 c=$(word "0x$SLOT_B + 0xF8")
-[ "$c" = "$HDR_CONF" ] && pass "slot B holds the device program, which had confirmed itself" \
-                       || fail "slot B's confirmed word reads ${c:-nothing}"
+[ "$c" = "ffffffff" ] && pass "slot B holds the device program with its state words erased: the swap leaves no mark on the image that left slot A" \
+                      || fail "slot B's confirmed word reads ${c:-nothing}"
 
 # ── 3. updates cut by a reset ──────────────────────────────────────────────
 echo ""

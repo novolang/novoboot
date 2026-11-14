@@ -6,6 +6,15 @@ pre-1.0 rule that a breaking change bumps the MINOR number.
 
 ## [Unreleased]
 
+### Fixed
+
+- A swap puts the image that leaves slot A into slot B with its three state words erased (pending, tried, confirmed), unless that image
+  failed its trial (pending, tried and not confirmed), which keeps its marks since they stop the bootloader from trying it again.  The marks of
+  the time an image ran in slot A stayed with it into slot B: an image that a request had marked pending and confirmed (the "Confirm" button
+  of a client on the row of the other image) was swapped back in at the next plain reset, after the update that had replaced it was confirmed.
+  `swaprec.nv` leaves the words out of the copy of the swap area's first unit into slot B; `tests/board_boot.sh` section 3b checks it on a
+  board and `smpsim.nv` of mcumgr-nv 0.1.2 does the same on RAM slots.
+
 ### Changed
 
 - `bootslot.accept_header` takes a header of more than one page, held by its first page: the nRF54LM20's vector table is aligned to 2 KB, so

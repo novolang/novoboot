@@ -13,6 +13,18 @@
 // source is erased only by the step after it, so a step can be done
 // again from the start for as long as the next one has not begun.
 //
+// The image that leaves slot A arrives in slot B with its three state
+// words erased (the header's pending, tried and confirmed words, at
+// bootimg.OFF_PENDING), unless it failed its trial: its marks belong to
+// the time it was in slot A, and kept, they would read as a request to
+// start it again (an image left pending, or pending and confirmed, is
+// swapped back in at the next reset).  A failed trial keeps its marks,
+// since they are what stops the bootloader from trying it again.  The
+// words are left out of the copy of the swap area's header unit into
+// slot B, which erased them; the decision reads the words in the swap
+// area, which holds slot A's first unit until the next unit's steps
+// begin, so a step done again decides as it did.
+//
 // The record, little-endian words from the status region's first byte
 // (docs/embedded/bootloader.md, The status region):
 //
@@ -33,6 +45,8 @@
 // is live only when the magic and both copies of n agree, so an erase
 // a reset interrupted, which leaves the bits of the region in no
 // particular state, does not read as one.
+
+use bootimg
 
 pub const REC_MAGIC = 0x50415753
 pub const REC_DONE = 0x454E4F44
@@ -137,6 +151,27 @@ fn unit_offset(lay: Layout, u: Int) -> Int [hw]
         off = off + hal.boot.unit_bytes(a + off)
     off
 
+// Whether the image in the swap area's first unit failed its trial: pending, tried and not confirmed.
+@tier(embedded)
+fn failed_trial(lay: Layout) -> Bool [hw]
+    hw.mmio_read(lay.sw + OFF_PENDING, 32) == STATE_PENDING and hw.mmio_read(lay.sw + OFF_TRIED, 32) == STATE_TRIED
+        and hw.mmio_read(lay.sw + OFF_CONFIRMED, 32) != STATE_CONFIRMED
+
+// Copies the bytes [from, to) of a unit from `src` to `dst`, leaving the three state words out when `skip` is set.
+@tier(embedded)
+fn copy_span(dst: Int, src: Int, from: Int, to: Int, skip: Bool) -> Int [hw]
+    let lo = OFF_PENDING
+    let hi = OFF_PENDING + 12
+    if not skip or to <= lo or from >= hi
+        return hal.boot.copy(dst + from, src + from, to - from)
+    var rc = 0
+    if from < lo
+        rc = hal.boot.copy(dst + from, src + from, lo - from)
+    if rc == 0 and to > hi
+        let start = if from > hi then from else hi
+        rc = hal.boot.copy(dst + start, src + start, to - start)
+    rc
+
 // Step `i`: erase its destination, then copy its source in two halves.
 @tier(embedded)
 fn step(lay: Layout, i: Int, fresh: Bool) -> Int [hw]
@@ -148,6 +183,8 @@ fn step(lay: Layout, i: Int, fresh: Bool) -> Int [hw]
     let phase = i % 3
     let dst = if phase == 0 then sw else if phase == 1 then a else b
     let src = if phase == 0 then a else if phase == 1 then b else sw
+    // Step 2 puts the image that left slot A into slot B.
+    let erase_marks = i == 2 and not failed_trial(lay)
     // A watchdog an image on trial started is still running after a reset
     // the watchdog did not cause, on a chip whose watchdog only its own
     // reset stops; each step is far shorter than a trial's timeout.
@@ -156,10 +193,10 @@ fn step(lay: Layout, i: Int, fresh: Bool) -> Int [hw]
     cut(3 * i + 1, fresh)
     let half = len / 2
     if rc == 0
-        rc = hal.boot.copy(dst, src, half)
+        rc = copy_span(dst, src, 0, half, erase_marks)
     cut(3 * i + 2, fresh)
     if rc == 0
-        rc = hal.boot.copy(dst + half, src + half, len - half)
+        rc = copy_span(dst, src, half, len, erase_marks)
     rc
 
 // Erases the status region.

@@ -3,6 +3,8 @@
 slot holds them) that a bootloader bench writes into a slot.
 
     imgtool.py pend   IN OUT              set the pending word
+    imgtool.py mark   IN OUT WORD...      set the named state words: pending,
+                                          tried, confirmed
     imgtool.py flip   IN OUT OFF BIT      flip bit BIT of byte OFF
     imgtool.py trunc  IN OUT N            keep the first N bytes
     imgtool.py field  IN OUT OFF VALUE    set the u32 at OFF, then the CRC
@@ -21,6 +23,7 @@ import sys
 
 L = 2**252 + 27742317777372353535851937790883648493
 PENDING = 0x444E4550
+STATE_WORDS = {"pending": (0xF0, 0x444E4550), "tried": (0xF4, 0x44595254), "confirmed": (0xF8, 0x464E4F43)}
 
 
 def crc32c(b):
@@ -49,6 +52,10 @@ def main():
     out = sys.argv[3]
     if op == "pend":
         struct.pack_into("<I", b, 0xF0, PENDING)
+    elif op == "mark":
+        for name in sys.argv[4:]:
+            off, word = STATE_WORDS[name]
+            struct.pack_into("<I", b, off, word)
     elif op == "flip":
         off, bit = int(sys.argv[4], 0), int(sys.argv[5])
         b[off] ^= 1 << bit
