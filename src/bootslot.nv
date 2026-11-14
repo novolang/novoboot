@@ -143,16 +143,20 @@ fn header_code<S: ByteSource[e]>(src: S, slot_bytes: Int, pol: Policy) -> Int [e
     IMG_OK
 
 // Checks the header in `buf`, the first `pol.header_bytes` bytes of an
-// image, and holds it for `begin`.  Answers IMG_OK, or the first check
+// image (the first page of them when the header is larger), and holds it for `begin`.  Answers IMG_OK, or the first check
 // the header fails; nothing is erased or written.
 pub @tier(embedded)
 fn accept_header<D: SlotDev[e] + ByteSource[f]>(dev: D, var pol: Policy, var buf: Page) -> Int [mutate, e, f]
     head_ok = false
     let hb = pol.header_bytes
-    if hb < 0x100 or hb > PAGE_BYTES or hb % 4 != 0 or buf.len() < hb
+    // A header of more than a page is held by its first page: the chip whose vector table is aligned to 2 KB (the nRF54LM20, with
+    // some 300 lines) has a header of 2 KB, whose fields are in its first 256 bytes and whose other bytes are 0xFF, which an erased
+    // slot reads as and `HeadSrc` answers for the bytes it does not hold.
+    let held = if hb > PAGE_BYTES then PAGE_BYTES else hb
+    if hb < 0x100 or hb % 4 != 0 or buf.len() < held
         return IMG_BAD_HEADER
     head.clear()
-    for i in 0..hb
+    for i in 0..held
         var b = buf[i] as Int
         // The state words are programmed when the update is committed,
         // never from the header that arrived.

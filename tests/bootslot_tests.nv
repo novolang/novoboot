@@ -155,6 +155,13 @@ fn test_a_header_is_checked_before_anything_is_erased() [io, mutate]
     test.assert_eq(bootslot.begin(ram, var pol), SLOT_NOT_STAGED)
     test.assert_eq(bootram.ops(), ops)
 
+    test.case("a header of 2 KB, as a chip whose vector table is aligned to 2 KB has, is held by its first page")
+    pol = policy(2048, false)
+    fill(hostimg.image(CHIP, BOARD, 2048, 0x01020003, 1, true, payload(100, 1)), 0, 512)
+    test.assert_eq(bootslot.accept_header(ram, var pol, var pg), IMG_OK)
+    test.assert_eq(bootslot.held_version(var pol), 0x01020003)
+    test.assert_eq(bootram.ops(), ops)
+
 @test
 fn test_an_unsigned_header_is_refused_where_signing_is_required() [io, mutate]
     with_old(image(0x01000000, 2000, 9))

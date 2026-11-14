@@ -18,7 +18,16 @@
 # default's 4 s to attach to an image on trial, and may define
 # SETTLE_WATCHDOG, which leaves no watchdog running behind blink on a
 # chip whose watchdog the probe's reset does not stop (the nRF52's),
-# run after blink is written.
+# run after blink is written.  A board whose probe or reset needs more may
+# set DL_FLAGS (flags for every `probe-rs download`), SLOT_ERASE_BYTES (the
+# bytes written 0xFF into a slot to empty it, the slot's size by default:
+# a board whose writes are slow empties the header and the start of the
+# slot, which is all the bootloader reads of an empty slot) and define
+# BOARD_RESET, the reset that starts the board in place of `probe-rs reset`, and
+# PROBE_RESET_MAX, the latest second at which the suite resets the board during a
+# swap (7.0 by default): a board whose swap of the test image ends sooner sets the
+# time the swap ends, since a reset after it falls in the trial of the new image,
+# which the bootloader reverts by design.
 #
 # The slots, the status region, the header size and the erase unit come
 # from the board's [flash] table through the build.
@@ -266,13 +275,21 @@ wait_probe() {
   while grep -qF -- "$SEL" <<< "$(pgrep -a -x probe-rs)"; do sleep 1; done
 }
 pr() {
-  local verb="$1" try; shift
+  local verb="$1" try flags=""; shift
+  [ "$verb" = download ] && flags="${DL_FLAGS:-}"
   for try in 1 2 3; do
     wait_probe
-    timeout 120 probe-rs "$verb" --chip "$CHIP" --probe "$SEL" "$@" && return 0
+    # shellcheck disable=SC2086
+    timeout 120 probe-rs "$verb" --chip "$CHIP" --probe "$SEL" $flags "$@" && return 0
     sleep 2
   done
   return 1
+}
+# The reset that starts the board: probe-rs's, or the board's own when its
+# script defines BOARD_RESET (the nRF54LM20 DK starts an image reliably
+# with a pin reset only).
+board_reset() {
+  if declare -F BOARD_RESET > /dev/null; then BOARD_RESET; else pr reset; fi
 }
 watch() {
   local log="$1" want="$2" secs="$3" verb="$4" runner; shift 4
@@ -305,7 +322,7 @@ COV_N=0
 # coverage table while it waits before the jump.
 boot() {
   local elf="$1" step="$2" secs=20 addr size
-  [ "${3:-}" = wait ] || pr reset > /dev/null 2>&1
+  [ "${3:-}" = wait ] || board_reset > /dev/null 2>&1
   # A session attached across the board's own reset ends at the reset,
   # and one cannot attach while the core stalls on a flash erase, so the
   # suite attaches again until a session reads the boot's lines, which
@@ -346,7 +363,10 @@ erased() { python3 -c "import sys; sys.stdout.buffer.write(b'\xff' * $1)" > "$2"
 # ── 2. the first boot ──────────────────────────────────────────────────────
 echo ""
 echo "2. the bootloader starts app1, which confirms itself"
-erased "$SLOT_LEN" "$WORK/erased_slot.bin"
+erased "${SLOT_ERASE_BYTES:-$SLOT_LEN}" "$WORK/erased_slot.bin"
+# The half-written image of section 5 needs the bytes after its first half
+# erased too, or old bytes of an image written there before could complete it.
+erased "$SLOT_LEN" "$WORK/erased_full.bin"
 if pr download "$WORK/boot.elf" > "$WORK/dl.log" 2>&1 && put "$WORK/erased_slot.bin" "$SLOT_A" \
    && put "$WORK/erased_slot.bin" "$SLOT_B" && put "$WORK/app1.img" "$SLOT_A"; then
   pass "the bootloader flashed, both slots erased, app1 written into slot A"
@@ -500,10 +520,10 @@ pr download "$WORK/boot.elf" > "$WORK/dl.log" 2>&1
 for n in 1 2 3 4; do
   put "$WORK/app1.img" "$SLOT_A"
   put "$WORK/app4_pend.img" "$SLOT_B"
-  delay=$(python3 -c "import random; print(round(random.uniform(0.3, 7.0), 2))")
-  pr reset > /dev/null 2>&1
+  delay=$(python3 -c "import random; print(round(random.uniform(0.3, ${PROBE_RESET_MAX:-7.0}), 2))")
+  board_reset > /dev/null 2>&1
   sleep "$delay"
-  pr reset > /dev/null 2>&1
+  board_reset > /dev/null 2>&1
   boot "$WORK/boot.elf" "s4r_$n" wait
   how=$(grep -aoE "swap resumed at step=[0-9]+|swap record complete, cleared|rule: swap, trial a|rule: trial a" <<< "$OUT" | head -1)
   run_app "$WORK/app4.elf" "app running" "s4r_${n}app"
@@ -531,7 +551,7 @@ expect "slot b: bad hash pending"                  "app2 with one bit of its ima
 expect "rule: boot a"                              "and slot A runs"
 n=$(stat -c %s "$WORK/app2_pend.img")
 python3 "$TOOL" trunc "$WORK/app2_pend.img" "$WORK/app2_half.img" $(( (n / 2 + 3) / 4 * 4 ))
-put "$WORK/erased_slot.bin" "$SLOT_B"
+put "$WORK/erased_full.bin" "$SLOT_B"
 put "$WORK/app2_half.img" "$SLOT_B"
 boot "$WORK/boot.elf" s4b
 expect "slot b: bad hash pending"                  "app2 with the second half of its image never written: refused"
@@ -666,7 +686,7 @@ else
   fail "the bootloader could not be built or flashed" "$(tail -4 "$WORK/final.log")"; finish
 fi
 put "$WORK/erased_slot.bin" "$SLOT_B"
-if put "$WORK/blink.img" "$SLOT_A" && pr reset > /dev/null 2>&1; then
+if put "$WORK/blink.img" "$SLOT_A" && board_reset > /dev/null 2>&1; then
   pass "blink written into slot A behind the bootloader, the board reset"
 else
   fail "blink could not be written"; finish

@@ -4,6 +4,16 @@ All notable changes to novoboot are recorded here.  This package follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html) with the
 pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## [Unreleased]
+
+### Changed
+
+- `bootslot.accept_header` takes a header of more than one page, held by its first page: the nRF54LM20's vector table is aligned to 2 KB, so
+  its header is 2 KB, whose fields are in the first 256 bytes and whose other bytes are 0xFF.  Before, a policy with a header of more
+  than 512 bytes answered `IMG_BAD_HEADER` to every header.  `tests/bootslot_tests.nv` has the case.
+- `tests/board_boot.sh` takes three optional settings of a board, `DL_FLAGS`, `SLOT_ERASE_BYTES` and `BOARD_RESET`, for the nRF54LM20 DK
+  (`orbit/bsp/nordic/nrf54/nrf54lm20-dk/tests/boot.sh`).
+
 ## [0.2.0] — 2026-11-14
 
 The slot writer: what an application uses to put an update into slot B.
