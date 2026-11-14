@@ -1,0 +1,638 @@
+// bootslot_tests: the slot writer on slots in RAM.
+//
+//   novo test tests/bootslot_tests.nv
+//
+// The device is bootram.nv's: two slots of 64 erase units of 256 bytes,
+// whose power can be cut after a chosen number of programs and erases.
+// An image is hostimg.nv's: 256 bytes of header and a payload, unsigned
+// unless a test says otherwise.
+//
+// The last tests cut the power at every flash operation of an update,
+// cleanly and with the operation torn, and ask the bootloader's own rule
+// (abrule.nv over bootimg.nv's checks of the two slots) what it would
+// start after each cut.  It must start the old image, or the new one
+// whole, and the update run again must end with the new image pending in
+// slot B.
+
+use std.test
+use std.bytes
+use bytes32
+use bootimg
+use abrule
+use bootslot
+use bootram
+use bootdev
+use hostimg
+use hostsrc
+
+let CHIP = 0x413
+let BOARD = 0x96A06A37
+let HB = 256
+let UNIT = 256
+
+var ram = bootram.ram_slots(UNIT, 64)
+var pol = policy(HB, false)
+var pg: Page = Vec.new()
+
+fn policy(hb: Int, required: Bool) -> Policy
+    Policy { header_bytes: hb, chip: CHIP, board: BOARD, signing_required: required,
+             key_present: false, key: bytes32.b32_zero() }
+
+fn fresh() [mutate]
+    ram = bootram.ram_slots(UNIT, 64)
+    pol = policy(HB, false)
+
+fn payload(n: Int, salt: Int) -> Bytes
+    var out: [Int] = []
+    for i in 0..n
+        list.push(out, (i * 7 + salt * 13 + (i >> 5)) & 0xFF)
+    bytes.from_byte_list(out)
+
+fn image(version: Int, n: Int, salt: Int) -> Bytes
+    hostimg.image(CHIP, BOARD, HB, version, salt, true, payload(n, salt))
+
+fn put_slot(slot: Int, img: Bytes) [mutate]
+    for i in 0..bytes.len(img)
+        bootram.poke(slot, i, bytes.byte_at(img, i) ?? 0xFF)
+
+fn poke_word(slot: Int, off: Int, w: Int) [mutate]
+    for i in 0..4
+        bootram.poke(slot, off + i, (w >> (8 * i)) & 0xFF)
+
+// `n` bytes of `img` from `off` in the page buffer.
+fn fill(img: Bytes, off: Int, n: Int) [mutate]
+    pg.clear()
+    for i in 0..n
+        let _ = pg.push((bytes.byte_at(img, off + i) ?? 0xFF) as u8)
+
+fn set_byte(i: Int, v: Int) [mutate]
+    pg[i] = (v & 0xFF) as u8
+
+fn view(slot: Int) -> BootRam [mutate]
+    if slot == 0
+        return ram.slot_a()
+    ram.slot_b()
+
+// The state the bootloader reads from slot `slot`.
+fn state(slot: Int) -> SlotState [mutate]
+    let v = view(slot)
+    SlotState { valid: bootimg.check_slot(v, v.src_len(), pol) == IMG_OK, pending: bootimg.is_pending(v),
+                tried: bootimg.is_tried(v), confirmed: bootimg.is_confirmed(v) }
+
+// Whether the 32 hash bytes of slot `slot` are the image's.
+fn holds(slot: Int, img: Bytes) -> Bool [mutate]
+    for i in 0..32
+        if bootram.peek(slot, 0x20 + i) != (bytes.byte_at(img, 0x20 + i) ?? 0)
+            return false
+    true
+
+// Stages the whole of `img`: the header, then its pages.  Answers the
+// first answer that is not 0.
+fn stage(img: Bytes) -> Int [mutate]
+    fill(img, 0, HB)
+    var rc = bootslot.accept_header(ram, var pol, var pg)
+    if rc != 0
+        return rc
+    rc = bootslot.begin(ram, var pol)
+    if rc != 0
+        return rc
+    let n = bytes.len(img) - HB
+    var off = 0
+    for _p in 0..64
+        if off < n
+            var len = n - off
+            if len > 512
+                len = 512
+            fill(img, HB + off, len)
+            rc = bootslot.program(ram, var pol, off, var pg)
+            if rc != 0
+                return rc
+            off = off + 512
+    0
+
+// The device holds `old` in slot A, as a probe writes it: valid, no
+// state word.
+fn with_old(old: Bytes) [mutate]
+    fresh()
+    put_slot(0, old)
+
+@test
+fn test_a_header_is_checked_before_anything_is_erased() [io, mutate]
+    let img = image(0x01020003, 3000, 1)
+    with_old(image(0x01000000, 2000, 9))
+    fill(img, 0, HB)
+    test.assert_eq(bootslot.accept_header(ram, var pol, var pg), IMG_OK)
+    test.assert_eq(bootslot.held_version(var pol), 0x01020003)
+
+    test.case("each fault answers its own check, and nothing is erased or written")
+    let ops = bootram.ops()
+    fill(hostimg.image(0x999, BOARD, HB, 1, 1, true, payload(100, 1)), 0, HB)
+    test.assert_eq(bootslot.accept_header(ram, var pol, var pg), IMG_WRONG_CHIP)
+    fill(hostimg.image(CHIP, 0x999, HB, 1, 1, true, payload(100, 1)), 0, HB)
+    test.assert_eq(bootslot.accept_header(ram, var pol, var pg), IMG_WRONG_BOARD)
+    fill(hostimg.image(CHIP, BOARD, HB, 1, 1, true, payload(64 * UNIT, 1)), 0, HB)
+    test.assert_eq(bootslot.accept_header(ram, var pol, var pg), IMG_BAD_SIZE)
+    fill(img, 0, HB)
+    set_byte(0x10, 0x55)
+    test.assert_eq(bootslot.accept_header(ram, var pol, var pg), IMG_BAD_CRC)
+    fill(img, 0, HB)
+    set_byte(0, 0x00)
+    test.assert_eq(bootslot.accept_header(ram, var pol, var pg), IMG_EMPTY)
+    fill(img, 0, HB)
+    set_byte(4, 2)
+    test.assert_eq(bootslot.accept_header(ram, var pol, var pg), IMG_BAD_CRC)
+    test.assert_eq(bootram.ops(), ops)
+
+    test.case("a header size the policy cannot hold, or a buffer shorter than the header")
+    pol = policy(0x80, false)
+    fill(img, 0, HB)
+    test.assert_eq(bootslot.accept_header(ram, var pol, var pg), IMG_BAD_HEADER)
+    pol = policy(1024, false)
+    test.assert_eq(bootslot.accept_header(ram, var pol, var pg), IMG_BAD_HEADER)
+    pol = policy(HB, false)
+    fill(img, 0, HB - 4)
+    test.assert_eq(bootslot.accept_header(ram, var pol, var pg), IMG_BAD_HEADER)
+    test.assert_eq(bootslot.begin(ram, var pol), SLOT_NOT_STAGED)
+    test.assert_eq(bootram.ops(), ops)
+
+@test
+fn test_an_unsigned_header_is_refused_where_signing_is_required() [io, mutate]
+    with_old(image(0x01000000, 2000, 9))
+    pol = policy(HB, true)
+    fill(image(0x01020003, 3000, 1), 0, HB)
+    test.assert_eq(bootslot.accept_header(ram, var pol, var pg), IMG_UNSIGNED)
+    test.assert_eq(bootslot.begin(ram, var pol), SLOT_NOT_STAGED)
+    test.assert_eq(bootram.ops(), 0)
+
+    test.case("a header that says it is signed is taken; the bootloader checks the signature")
+    fill(hostimg.image(CHIP, BOARD, HB, 0x01020003, 1, false, payload(3000, 1)), 0, HB)
+    test.assert_eq(bootslot.accept_header(ram, var pol, var pg), IMG_OK)
+
+@test
+fn test_an_update_is_staged_committed_and_leaves_slot_a_alone() [io, mutate]
+    let old = image(0x01000000, 2000, 9)
+    let img = image(0x01020003, 4501, 1)
+    with_old(old)
+    let before = bootram.ops()
+    test.assert_eq(stage(img), 0)
+    test.assert(bootram.ops() > before)
+    test.assert(holds(0, old))
+    test.assert(state(1).valid)
+    test.assert(not state(1).pending)
+    test.assert_eq(bootslot.durable(ram, var pol), 4096)
+    test.assert(not bootslot.is_pending(ram))
+
+    test.case("the commit checks the hash and programs the pending word")
+    test.assert_eq(bootslot.commit(ram, var pol), 0)
+    test.assert(bootslot.is_pending(ram))
+    test.assert_eq(bootslot.durable(ram, var pol), 4501)
+    test.assert_eq(bootslot.commit(ram, var pol), 0)
+    test.assert(holds(1, img))
+    let b = state(1)
+    test.assert(b.valid and b.pending)
+    test.assert(not b.tried)
+    test.assert_eq(abrule.decide(state(0), b), ACT_SWAP_TRIAL)
+    test.assert_eq(bootram.peek(1, 0xF4), 0xFF)
+
+    test.case("every byte of the image is in slot B")
+    var differ = 0
+    for i in 0..bytes.len(img)
+        if i < 0xF0 or i >= 0x100
+            if bootram.peek(1, i) != (bytes.byte_at(img, i) ?? 0)
+                differ = differ + 1
+    test.assert_eq(differ, 0)
+
+@test
+fn test_state_words_in_the_arriving_header_are_not_programmed() [io, mutate]
+    let img = image(0x01020003, 600, 4)
+    with_old(image(0x01000000, 2000, 9))
+    fill(img, 0, HB)
+    set_byte(0xF0, 0x50)
+    set_byte(0xF4, 0x54)
+    set_byte(0xF8, 0x43)
+    test.assert_eq(bootslot.accept_header(ram, var pol, var pg), IMG_OK)
+    test.assert_eq(bootslot.begin(ram, var pol), 0)
+    test.assert_eq(bootram.peek(1, 0xF0), 0xFF)
+    test.assert_eq(bootram.peek(1, 0xF4), 0xFF)
+    test.assert_eq(bootram.peek(1, 0xF8), 0xFF)
+
+@test
+fn test_a_transfer_resumes_from_the_last_page_that_holds_data() [io, mutate]
+    with_old(image(0x01000000, 2000, 9))
+    test.assert_eq(bootslot.durable(ram, var pol), 0)
+    test.assert_eq(bootslot.staged_bytes(ram, var pol), 0)
+    test.assert(not bootslot.staged(ram, var pol))
+
+    test.case("a header alone, then pages")
+    let img = image(0x01020003, 3000, 1)
+    fill(img, 0, HB)
+    test.assert_eq(bootslot.accept_header(ram, var pol, var pg), 0)
+    test.assert_eq(bootslot.begin(ram, var pol), 0)
+    test.assert(bootslot.staged(ram, var pol))
+    test.assert_eq(bootslot.staged_bytes(ram, var pol), 3000)
+    test.assert_eq(bootslot.durable(ram, var pol), 0)
+    fill(img, HB, 512)
+    test.assert_eq(bootslot.program(ram, var pol, 0, var pg), 0)
+    test.assert_eq(bootslot.durable(ram, var pol), 0)
+    fill(img, HB + 512, 512)
+    test.assert_eq(bootslot.program(ram, var pol, 512, var pg), 0)
+    test.assert_eq(bootslot.durable(ram, var pol), 512)
+
+    test.case("a page of 0xFF after the last page of data is not counted")
+    pg.clear()
+    for _i in 0..512
+        let _ = pg.push(0xFF as u8)
+    test.assert_eq(bootslot.program(ram, var pol, 1024, var pg), 0)
+    test.assert_eq(bootslot.durable(ram, var pol), 512)
+
+    test.case("a torn page is found as the last page, and written again")
+    bootram.schedule_cut(1, 8)
+    fill(img, HB + 1536, 512)
+    test.assert_eq(bootslot.program(ram, var pol, 1536, var pg), SLOT_FLASH)
+    bootram.restore()
+    test.assert_eq(bootslot.durable(ram, var pol), 1536)
+    test.assert_eq(bootslot.program(ram, var pol, 1536, var pg), 0)
+    test.assert_eq(bootslot.durable(ram, var pol), 1536)
+    fill(img, HB + 1024, 512)
+    test.assert_eq(bootslot.program(ram, var pol, 1024, var pg), 0)
+    fill(img, HB + 2048, 512)
+    test.assert_eq(bootslot.program(ram, var pol, 2048, var pg), 0)
+    fill(img, HB + 2560, 440)
+    test.assert_eq(bootslot.program(ram, var pol, 2560, var pg), 0)
+    test.assert_eq(bootslot.commit(ram, var pol), 0)
+    test.assert(holds(1, img))
+
+@test
+fn test_pages_outside_the_image_or_with_nothing_staged_are_refused() [io, mutate]
+    with_old(image(0x01000000, 2000, 9))
+    fill(image(0x01020003, 700, 1), HB, 512)
+    test.assert_eq(bootslot.program(ram, var pol, 0, var pg), SLOT_NOT_STAGED)
+    test.assert_eq(bootslot.commit(ram, var pol), SLOT_NOT_STAGED)
+    let img = image(0x01020003, 700, 1)
+    test.assert_eq(stage(img), 0)
+    fill(img, HB, 512)
+    test.assert_eq(bootslot.program(ram, var pol, 512, var pg), SLOT_RANGE)
+    test.assert_eq(bootslot.program(ram, var pol, 0 - 4, var pg), SLOT_RANGE)
+    test.assert_eq(bootslot.program(ram, var pol, 2, var pg), SLOT_RANGE)
+    pg.clear()
+    test.assert_eq(bootslot.program(ram, var pol, 0, var pg), SLOT_RANGE)
+
+@test
+fn test_an_image_that_is_not_the_one_the_header_names_is_not_committed() [io, mutate]
+    let img = image(0x01020003, 1200, 3)
+    with_old(image(0x01000000, 2000, 9))
+    test.assert_eq(stage(img), 0)
+    test.assert_eq(bootslot.commit(ram, var pol), 0)
+
+    test.case("a flipped byte fails the hash; abandon erases the header")
+    with_old(image(0x01000000, 2000, 9))
+    fill(img, 0, HB)
+    test.assert_eq(bootslot.accept_header(ram, var pol, var pg), 0)
+    test.assert_eq(bootslot.begin(ram, var pol), 0)
+    var off = 0
+    for _p in 0..3
+        var len = 1200 - off
+        if len > 512
+            len = 512
+        fill(img, HB + off, len)
+        if off == 512
+            set_byte(7, (pg[7] as Int) ^ 1)
+        test.assert_eq(bootslot.program(ram, var pol, off, var pg), 0)
+        off = off + 512
+    test.assert_eq(bootslot.commit(ram, var pol), IMG_BAD_HASH)
+    test.assert(not bootslot.is_pending(ram))
+    bootram.schedule_cut(1, 0 - 1)
+    test.assert_eq(bootslot.abandon(ram, var pol), SLOT_FLASH)
+    bootram.restore()
+    test.assert(bootslot.staged(ram, var pol))
+    test.assert_eq(bootslot.abandon(ram, var pol), 0)
+    test.assert(not bootslot.staged(ram, var pol))
+
+@test
+fn test_the_image_the_bootloader_would_revert_to_is_not_erased() [io, mutate]
+    let old = image(0x01000000, 2000, 9)
+    let img = image(0x01020003, 1500, 1)
+    // Slot A runs on trial: the update the bootloader swapped in, pending
+    // and tried, not confirmed.  Slot B holds the image it replaced.
+    with_old(old)
+    put_slot(0, img)
+    poke_word(0, OFF_PENDING, STATE_PENDING)
+    poke_word(0, OFF_TRIED, STATE_TRIED)
+    put_slot(1, old)
+    let ops = bootram.ops()
+    fill(image(0x02000000, 800, 5), 0, HB)
+    test.assert_eq(bootslot.accept_header(ram, var pol, var pg), 0)
+    test.assert_eq(bootslot.begin(ram, var pol), SLOT_BUSY)
+    test.assert_eq(bootslot.erase(ram, var pol), SLOT_BUSY)
+    test.assert_eq(bootslot.abandon(ram, var pol), SLOT_BUSY)
+    test.assert_eq(bootram.ops(), ops)
+    test.assert(holds(1, old))
+
+    test.case("once slot A confirms itself the slot is free")
+    poke_word(0, OFF_CONFIRMED, STATE_CONFIRMED)
+    test.assert_eq(bootslot.begin(ram, var pol), 0)
+
+    test.case("slot B holding a failed trial, a torn image or nothing is no revert target")
+    fresh()
+    put_slot(0, img)
+    poke_word(0, OFF_PENDING, STATE_PENDING)
+    poke_word(0, OFF_TRIED, STATE_TRIED)
+    put_slot(1, old)
+    poke_word(1, OFF_PENDING, STATE_PENDING)
+    poke_word(1, OFF_TRIED, STATE_TRIED)
+    test.assert_eq(bootslot.erase(ram, var pol), 0)
+    put_slot(1, old)
+    bootram.poke(1, 0x500, 0x00)
+    test.assert_eq(bootslot.erase(ram, var pol), 0)
+    test.assert_eq(bootslot.erase(ram, var pol), 0)
+
+    test.case("slot A holding something else is nothing to revert from")
+    fresh()
+    put_slot(1, old)
+    test.assert_eq(bootslot.erase(ram, var pol), 0)
+    put_slot(0, img)
+    poke_word(0, OFF_TRIED, STATE_TRIED)
+    put_slot(1, old)
+    test.assert_eq(bootslot.erase(ram, var pol), SLOT_BUSY)
+    put_slot(0, img)
+    put_slot(1, old)
+    test.assert_eq(bootslot.erase(ram, var pol), 0)
+
+@test
+fn test_a_tried_image_in_slot_b_is_not_staged_and_not_committed() [io, mutate]
+    let img = image(0x01020003, 1000, 2)
+    with_old(image(0x01000000, 2000, 9))
+    test.assert_eq(stage(img), 0)
+    poke_word(1, OFF_PENDING, STATE_PENDING)
+    poke_word(1, OFF_TRIED, STATE_TRIED)
+    test.assert(not bootslot.staged(ram, var pol))
+    test.assert_eq(bootslot.commit(ram, var pol), SLOT_NOT_STAGED)
+    test.assert_eq(bootslot.durable(ram, var pol), 0)
+
+@test
+fn test_the_report_reads_both_headers() [io, mutate]
+    let old = image(0x01000005, 2000, 9)
+    let img = image(0x01020003, 1500, 1)
+    with_old(old)
+    var a = bootslot.slot_info(ram, var pol, 0, true)
+    test.assert(a.valid)
+    test.assert_eq(a.version, 0x01000005)
+    test.assert(not (a.pending or a.tried or a.confirmed))
+    test.assert_eq(a.hash.at(0), bytes.byte_at(old, 0x20) ?? 0)
+    var b = bootslot.slot_info(ram, var pol, 1, true)
+    test.assert(not b.valid)
+
+    test.case("a pending update in B; a hash that fails is invalid only when verified")
+    test.assert_eq(stage(img), 0)
+    test.assert_eq(bootslot.commit(ram, var pol), 0)
+    poke_word(0, OFF_CONFIRMED, STATE_CONFIRMED)
+    a = bootslot.slot_info(ram, var pol, 0, false)
+    test.assert(a.confirmed)
+    b = bootslot.slot_info(ram, var pol, 1, true)
+    test.assert(b.valid and b.pending)
+    test.assert_eq(b.version, 0x01020003)
+    poke_word(1, OFF_TRIED, STATE_TRIED)
+    b = bootslot.slot_info(ram, var pol, 1, false)
+    test.assert(b.tried)
+    bootram.poke(1, 0x400, 0x5A)
+    test.assert(bootslot.slot_info(ram, var pol, 1, false).valid)
+    test.assert(not bootslot.slot_info(ram, var pol, 1, true).valid)
+
+// A device whose erase and program answer success and change nothing,
+// and whose erase unit is `unit` bytes: the flash lying about its work.
+@value
+struct Liar
+    unit: Int
+
+impl ByteSource[] for Liar
+    @tier(embedded)
+    fn src_len(self) -> Int
+        8192
+
+    @tier(embedded)
+    fn src_at(self, i: Int) -> Int
+        0xFF
+
+    @tier(embedded)
+    fn src_window(self, off: Int, n: Int) -> Liar
+        self
+
+impl SlotDev[] for Liar
+    @tier(embedded)
+    fn slot_a(self) -> Liar
+        self
+
+    @tier(embedded)
+    fn slot_b(self) -> Liar
+        self
+
+    @tier(embedded)
+    fn unit_bytes(self, off: Int) -> Int
+        self.unit
+
+    @tier(embedded)
+    fn erase_unit(self, off: Int) -> Int
+        0
+
+    @tier(embedded)
+    fn program(self, off: Int, var src: Page) -> Int
+        0
+
+@test
+fn test_a_flash_that_changes_nothing_is_reported() [io, mutate]
+    let lie = Liar { unit: 0 }
+    fill(image(0x01020003, 100, 1), 0, HB)
+    test.assert_eq(bootslot.accept_header(lie, var pol, var pg), IMG_OK)
+    test.assert_eq(bootslot.begin(lie, var pol), SLOT_FLASH)
+    test.assert_eq(bootslot.accept_header(lie, var pol, var pg), IMG_OK)
+    let sized = Liar { unit: 4096 }
+    test.assert_eq(bootslot.begin(sized, var pol), SLOT_FLASH)
+    test.assert_eq(bootslot.erase(sized, var pol), 0)
+    test.assert_eq(bootslot.abandon(sized, var pol), 0)
+    test.assert_eq(bootslot.erase(lie, var pol), SLOT_FLASH)
+
+@test
+fn test_the_staged_header_is_a_byte_source() [io, mutate]
+    fresh()
+    let img = image(0x01020003, 100, 1)
+    fill(img, 0, HB)
+    test.assert_eq(bootslot.accept_header(ram, var pol, var pg), IMG_OK)
+    let h = HeadSrc { base: 0, n: HB }
+    test.assert_eq(h.src_len(), HB)
+    test.assert_eq(h.src_at(0), 0x4E)
+    test.assert_eq(h.src_at(0 - 1), 0xFF)
+    test.assert_eq(h.src_at(HB), 0xFF)
+    let w = h.src_window(4, 8)
+    test.assert_eq(w.src_len(), 8)
+    test.assert_eq(w.src_at(0), 1)
+    let v = ram.slot_b().src_window(16, 32)
+    test.assert_eq(v.src_len(), 32)
+    test.assert_eq(v.src_at(0), 0xFF)
+
+// The update of `img` as an application runs it after a restart: the
+// header is checked; a transfer of this image already in slot B goes on
+// from the last page that holds data, anything else begins again.  Answers
+// the first answer that is not 0.
+fn update(img: Bytes) -> Int [mutate]
+    fill(img, 0, HB)
+    var rc = bootslot.accept_header(ram, var pol, var pg)
+    if rc != 0
+        return rc
+    var from = 0
+    if bootslot.staged(ram, var pol) and holds(1, img)
+        from = bootslot.durable(ram, var pol)
+    else
+        rc = bootslot.begin(ram, var pol)
+        if rc != 0
+            return rc
+    let n = bytes.len(img) - HB
+    var off = from
+    for _p in 0..64
+        if off < n
+            var len = n - off
+            if len > 512
+                len = 512
+            fill(img, HB + off, len)
+            rc = bootslot.program(ram, var pol, off, var pg)
+            if rc != 0
+                return rc
+            off = off + 512
+    bootslot.commit(ram, var pol)
+
+// What the bootloader starts from the two slots: 1 the image `old`, 2 the
+// image `new`, 0 anything else, a refused boot or a revert included.
+fn starts(old: Bytes, new: Bytes) -> Int [mutate]
+    let a = state(0)
+    let b = state(1)
+    let act = abrule.decide(a, b)
+    if act == ACT_BOOT or act == ACT_TRIAL
+        if a.valid and holds(0, old)
+            return 1
+        return 0
+    if act == ACT_SWAP_TRIAL
+        if b.valid and holds(1, new)
+            return 2
+    0
+
+// Installs `old` in slot A, cuts the power after `k` operations of the
+// update to `new`, torn by `tear`, restarts, reads what the bootloader
+// would start, and runs the update again.  0 when every check held; 1
+// when the bootloader would start something else; 2 when the update run
+// again did not leave `new` pending; with 10 added when the run after
+// the cut resumed past the start.
+fn cut_once(old: Bytes, new: Bytes, k: Int, tear: Int) -> Int [mutate]
+    with_old(old)
+    bootram.schedule_cut(k, tear)
+    let _ = update(new)
+    bootram.restore()
+    if starts(old, new) == 0
+        return 1
+    var resumed = 0
+    fill(new, 0, HB)
+    let _ = bootslot.accept_header(ram, var pol, var pg)
+    if bootslot.staged(ram, var pol) and holds(1, new) and bootslot.durable(ram, var pol) > 0
+        resumed = 10
+    if update(new) != 0
+        return 2
+    if starts(old, new) != 2
+        return 2
+    resumed
+
+@test
+fn test_a_power_cut_at_every_flash_operation_leaves_an_image_and_the_update_completes() [io, mutate]
+    let old = image(0x01000000, 2000, 9)
+    let new = image(0x01020003, 4501, 1)
+    with_old(old)
+    test.assert_eq(update(new), 0)
+    let n = bootram.ops()
+    test.case("an update of 4,501 bytes takes ${n} programs and erases")
+    test.assert(n > 20)
+    var cuts = 0
+    var bad = 0
+    var resumed = 0
+    for k in 1..n + 1
+        for tear in [0 - 1, 8]
+            let rc = cut_once(old, new, k, tear)
+            cuts = cuts + 1
+            if rc >= 10
+                resumed = resumed + 1
+            if rc % 10 != 0
+                bad = bad + 1
+                println("cut after ${k} operations, tear ${tear}: ${rc}")
+    println("bootslot power-cut loop: ${cuts} cuts, ${resumed} resumed past the start, ${bad} unexplained")
+    test.assert_eq(bad, 0)
+    test.assert(resumed > 0)
+
+@test
+fn test_the_boards_numbers_become_a_policy_and_slots() [io, mutate]
+    let p = bootdev.policy(512, CHIP, BOARD, 1)
+    test.assert_eq(p.header_bytes, 512)
+    test.assert_eq(p.chip, CHIP)
+    test.assert_eq(p.board, BOARD)
+    test.assert(p.signing_required)
+    test.assert(not p.key_present)
+    test.assert(not bootdev.policy(512, CHIP, BOARD, 0).signing_required)
+    let s = bootdev.slots(0x08020000, 0x40000, 0x08060000, 0x20000)
+    test.assert_eq(s.a_start, 0x08020000)
+    test.assert_eq(s.a_bytes, 0x40000)
+    test.assert_eq(s.b_start, 0x08060000)
+    test.assert_eq(s.b_bytes, 0x20000)
+    test.assert_eq(s.n, 0x20000)
+    test.assert_eq(s.slot, SLOT_B)
+
+@test
+fn test_the_ram_device_keeps_nor_rules() [io, mutate]
+    fresh()
+    pg.clear()
+    for _i in 0..4
+        let _ = pg.push(0xF0 as u8)
+    test.assert_eq(ram.program(0, var pg), 0)
+    pg.clear()
+    for _i in 0..4
+        let _ = pg.push(0x0F as u8)
+    test.assert_eq(ram.program(0, var pg), 0)
+    test.case("a program only clears bits, so the second one ANDs into the first")
+    test.assert_eq(bootram.peek(1, 0), 0xF0 & 0x0F)
+    test.assert_eq(ram.src_at(0), 0)
+    test.assert_eq(ram.erase_unit(0), 0)
+    test.assert_eq(bootram.peek(1, 0), 0xFF)
+    test.case("an unaligned program, a program or erase outside the slot, a read outside it")
+    let size = ram.src_len()
+    test.assert_eq(ram.program(2, var pg), 1)
+    test.assert_eq(ram.program(size, var pg), 1)
+    test.assert_eq(ram.erase_unit(size), 1)
+    test.assert_eq(ram.unit_bytes(size), 0)
+    test.assert_eq(ram.unit_bytes(0), UNIT)
+    test.assert_eq(ram.src_at(size), 0xFF)
+    test.assert_eq(ram.src_at(0 - 1), 0xFF)
+    test.assert_eq(ram.slot_a().src_len(), size)
+    test.case("the geometry is cut down to the buffer")
+    let big = bootram.ram_slots(1024, 100)
+    test.assert_eq(big.src_len(), 16384)
+    fresh()
+
+    test.case("a cut: the operation in flight is lost or torn, and the power stays off")
+    pg.clear()
+    for _i in 0..8
+        let _ = pg.push(0x00 as u8)
+    bootram.schedule_cut(2, 4)
+    test.assert_eq(ram.program(0, var pg), 0)
+    test.assert_eq(ram.program(8, var pg), 2)
+    test.assert(bootram.is_off())
+    test.assert_eq(bootram.peek(1, 8), 0)
+    test.assert_eq(bootram.peek(1, 12), 0xFF)
+    test.assert_eq(ram.program(16, var pg), 2)
+    test.assert_eq(ram.erase_unit(0), 2)
+    test.assert_eq(ram.src_at(0), 0xFF)
+    bootram.restore()
+    bootram.schedule_cut(1, 0 - 1)
+    test.assert_eq(ram.erase_unit(0), 2)
+    test.assert_eq(bootram.peek(1, 0), 0)
+    bootram.restore()
+    bootram.schedule_cut(1, 0)
+    test.assert_eq(ram.erase_unit(0), 2)
+    test.assert_eq(bootram.peek(1, 0), 0xFF)
+    test.assert_eq(bootram.peek(1, UNIT / 2), 0xFF)
+    bootram.restore()
+    bootram.schedule_cut(1, 100)
+    test.assert_eq(ram.program(0, var pg), 2)

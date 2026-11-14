@@ -1,0 +1,183 @@
+// bootram.nv: slot A and slot B in RAM, with power cuts on demand.
+//
+// `BootRam` is a `SlotDev` and a `ByteSource` (bootslot.nv) over two
+// module-level buffers of 16,384 bytes, so it needs no heap and no
+// foreign function.  It keeps NOR flash's rules: an erase sets a unit's
+// bytes to 0xFF, a program only clears bits, and an offset and a length
+// are multiples of 4.  The slots are `units` erase units of `unit` bytes
+// each.
+//
+// A power cut is scheduled with `schedule_cut(after, tear)`: the next
+// `after` programs and erases succeed, and the one after that is the
+// cut.  With `tear` below 0 it changes nothing; with `tear` at 0 or
+// above, a program applies its first `tear` bytes and an erase erases the
+// first half of the unit.  Every operation after the cut fails until
+// `restore`, as a device with no power does, and a read answers 0xFF.
+//
+// Slot A is written with `poke`, as the probe or the bootloader writes
+// it; the writer cannot reach it.
+
+use bytes32
+use bootslot
+
+// The bytes of each slot.
+pub const RAM_SLOT_CAP = 16384
+
+var cells_a: Vec[u8; 16384] = Vec.new()
+var cells_b: Vec[u8; 16384] = Vec.new()
+
+// -1: no cut scheduled; 0: the power is off.
+var ops_left = 0 - 1
+var tear_at  = 0 - 1
+var op_count = 0
+
+// The geometry of the slots, and the slot or window the value reads.
+pub @value
+struct BootRam
+    unit: Int
+    bytes: Int
+    slot: Int
+    base: Int
+    n: Int
+
+// Two slots of `units` erase units of `unit` bytes, every byte erased and
+// no cut scheduled.  The unit count is reduced to fit `RAM_SLOT_CAP`.  The
+// value reads slot B.
+pub @tier(embedded)
+fn ram_slots(unit: Int, units: Int) -> BootRam [mutate]
+    var u = units
+    if unit * u > RAM_SLOT_CAP
+        u = RAM_SLOT_CAP / unit
+    cells_a.clear()
+    cells_b.clear()
+    for _i in 0..unit * u
+        let _ = cells_a.push(0xFF as u8)
+        let _ = cells_b.push(0xFF as u8)
+    ops_left = 0 - 1
+    tear_at = 0 - 1
+    op_count = 0
+    BootRam { unit: unit, bytes: unit * u, slot: SLOT_B, base: 0, n: unit * u }
+
+// Cut the power after `after` more programs and erases; `tear` as the
+// module comment says.
+pub @tier(embedded)
+fn schedule_cut(after: Int, tear: Int) [mutate]
+    ops_left = after
+    tear_at = tear
+
+// Turn the power back on and cancel any cut.
+pub @tier(embedded)
+fn restore() [mutate]
+    ops_left = 0 - 1
+    tear_at = 0 - 1
+
+// Whether the power is off.
+pub @tier(embedded)
+fn is_off() -> Bool [mutate]
+    ops_left == 0
+
+// How many programs and erases have completed since the slots were made.
+pub @tier(embedded)
+fn ops() -> Int [mutate]
+    op_count
+
+// The byte at `i` of slot `slot`, whatever the power.
+pub @tier(embedded)
+fn peek(slot: Int, i: Int) -> Int [mutate]
+    if slot == SLOT_A
+        return cells_a[i] as Int
+    cells_b[i] as Int
+
+// Sets the byte at `i` of slot `slot`, as a probe or the bootloader
+// writes the slot; no NOR rule is applied.
+pub @tier(embedded)
+fn poke(slot: Int, i: Int, b: Int) [mutate]
+    if slot == SLOT_A
+        cells_a[i] = (b & 0xFF) as u8
+    else
+        cells_b[i] = (b & 0xFF) as u8
+
+// 0: go ahead; 1: this operation is the cut; 2: the power is off.
+@tier(embedded)
+fn gate() -> Int [mutate]
+    if ops_left < 0
+        return 0
+    if ops_left == 0
+        return 2
+    ops_left = ops_left - 1
+    if ops_left == 0
+        return 1
+    0
+
+impl ByteSource[mutate] for BootRam
+    @tier(embedded)
+    fn src_len(self) -> Int [mutate]
+        self.n
+
+    @tier(embedded)
+    fn src_at(self, i: Int) -> Int [mutate]
+        let at = self.base + i
+        if ops_left == 0 or i < 0 or at >= self.bytes
+            return 0xFF
+        peek(self.slot, at)
+
+    @tier(embedded)
+    fn src_window(self, off: Int, n: Int) -> BootRam [mutate]
+        BootRam { unit: self.unit, bytes: self.bytes, slot: self.slot, base: self.base + off, n: n }
+
+impl SlotDev[mutate] for BootRam
+    @tier(embedded)
+    fn slot_a(self) -> BootRam [mutate]
+        BootRam { unit: self.unit, bytes: self.bytes, slot: SLOT_A, base: 0, n: self.bytes }
+
+    @tier(embedded)
+    fn slot_b(self) -> BootRam [mutate]
+        BootRam { unit: self.unit, bytes: self.bytes, slot: SLOT_B, base: 0, n: self.bytes }
+
+    @tier(embedded)
+    fn unit_bytes(self, off: Int) -> Int [mutate]
+        if off < 0 or off >= self.bytes
+            return 0
+        self.unit
+
+    @tier(embedded)
+    fn erase_unit(self, off: Int) -> Int [mutate]
+        if off < 0 or off >= self.bytes
+            return 1
+        let g = gate()
+        if g == 2
+            return 2
+        var n = self.unit
+        if g == 1
+            n = 0
+            if tear_at >= 0
+                n = self.unit / 2
+        let base = off - off % self.unit
+        for i in 0..n
+            cells_b[base + i] = 0xFF as u8
+        if g == 1
+            return 2
+        op_count = op_count + 1
+        0
+
+    @tier(embedded)
+    fn program(self, off: Int, var src: Page) -> Int [mutate]
+        let len = src.len()
+        if off < 0 or off + len > self.bytes or off % 4 != 0 or len % 4 != 0
+            return 1
+        let g = gate()
+        if g == 2
+            return 2
+        var n = len
+        if g == 1
+            n = tear_at
+            if n > len
+                n = len
+            if n < 0
+                n = 0
+        for i in 0..n
+            cells_b[off + i] = (cells_b[off + i] as Int & src[i] as Int) as u8
+        if g == 1
+            return 2
+        op_count = op_count + 1
+        0

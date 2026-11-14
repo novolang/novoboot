@@ -1,0 +1,70 @@
+// slot_probe.nv: the slot writer on a board's own slots, built for a
+// board with a [flash] table.
+//
+//   novo build --target=stm32f407g-disc1 --role=application tests/slot_probe.nv
+//
+// tests/orbit/test_novoboot.sh builds it for each board that has a table.
+// It is built and never flashed: it calls every function of the writer,
+// `erase` included, so that each is linked and `@no_alloc` has been
+// checked over them.  Run on a board it would erase slot B.
+
+use bytes32
+use bootimg
+use bootslot
+use bootdev
+
+var pol = bootdev.policy(0, 0, 0, 0)
+var pg: Page = Vec.new()
+
+@tier(embedded)
+fn say(s: Str) [hw]
+    hal.uart.write(s)
+
+@tier(embedded)
+fn say_int(n: Int) [hw]
+    var div = 1
+    for _d in 0..9
+        if div * 10 <= n
+            div = div * 10
+    for _d in 0..10
+        if div >= 1
+            hal.uart.write_byte(48 + (n / div) % 10)
+            div = div / 10
+
+@tier(embedded)
+fn say_slot(name: Str, i: SlotInfo) [hw]
+    say(name)
+    say(if i.valid then " valid v" else " none v")
+    say_int(i.version >> 24)
+    say(if i.pending then " pending" else "")
+    say(if i.tried then " tried" else "")
+    say(if i.confirmed then " confirmed" else "")
+    say("\n")
+
+@no_alloc
+@tier(embedded)
+fn probe() [hw, mutate]
+    pol = bootdev.policy(bsp.board.flash_header_bytes(), bsp.board.flash_chip_id(),
+                         bsp.board.flash_board_id(), bsp.board.flash_signing_required())
+    let dev = bootdev.slots(bsp.board.flash_slot_a_start(), bsp.board.flash_slot_a_bytes(),
+                            bsp.board.flash_slot_b_start(), bsp.board.flash_slot_b_bytes())
+    say_slot("a", bootslot.slot_info(dev, var pol, SLOT_A, false))
+    say_slot("b", bootslot.slot_info(dev, var pol, SLOT_B, false))
+    pg.clear()
+    for _i in 0..pol.header_bytes
+        let _ = pg.push(0 as u8)
+    let rc = bootslot.accept_header(dev, var pol, var pg)
+    say("accept ")
+    say_int(rc)
+    say("\n")
+    say_int(bootslot.begin(dev, var pol))
+    say_int(bootslot.program(dev, var pol, 0, var pg))
+    say_int(bootslot.commit(dev, var pol))
+    say_int(bootslot.durable(dev, var pol))
+    say_int(bootslot.staged_bytes(dev, var pol))
+    say_int(bootslot.abandon(dev, var pol) * 0 + bootslot.erase(dev, var pol) * 0)
+
+@tier(embedded)
+fn main() [hw, mutate]
+    bsp.board.init()
+    probe()

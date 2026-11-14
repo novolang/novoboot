@@ -1,0 +1,375 @@
+// bootslot.nv: the writer that stages an update into slot B.
+//
+// The bootloader (main.nv) reads both slots and moves images; this
+// module is what a running application uses to put a new image into
+// slot B and mark it for the next boot.  It writes slot B and nothing
+// else: slot A, the swap area and the status region are not reachable
+// through `SlotDev`, so a bug here cannot touch the image that runs.
+//
+// The device is one value that is both a `SlotDev` and a `ByteSource`
+// (bytes32.nv): `ByteSource` reads one slot, `SlotDev` names the slots,
+// erases and programs slot B.  `slot_a()` and `slot_b()` answer the same
+// device read as the one slot or the other, so the checks of bootimg.nv
+// and the hash read a slot through the device and nothing is copied or
+// allocated.  `hal.boot` and `hw.mem_read8` are that device on a board
+// (bootdev.nv), RAM with power cuts in a test (bootram.nv).  An offset is
+// in bytes from the start of the slot.
+//
+// An update goes through these calls, in this order:
+//
+//   accept_header   the image's first `header_bytes` bytes are checked
+//                   before anything is erased: the magic, the header's
+//                   CRC-32C, the header version and size, the chip and
+//                   board ids against the policy, the image within the
+//                   slot, and the unsigned bit against the signing policy
+//                   (IMG_UNSIGNED where the manifest says "required").
+//   begin           slot B is erased unit by unit through the end of the
+//                   image, unless it holds the only image the bootloader
+//                   could go back to (SLOT_BUSY), and the header is
+//                   programmed.  The three state words of the header
+//                   (pending, tried, confirmed) are programmed erased.
+//   program         the image's bytes, a page at a time, each read back.
+//   commit          the SHA-256 of the whole image is checked against
+//                   the header, then the pending word is programmed.  The
+//                   next reset runs rule 2 of abrule.nv.
+//
+// A reset at any point leaves slot A as it was.  Slot B then holds an
+// erased unit, a header with part of its image, or a whole image that
+// is not yet pending; the bootloader starts none of these, since the
+// first fails the header check and the others fail the hash.  Nothing
+// records how far the transfer got.  `durable` finds the offset to
+// resume from by reading slot B: the start of the last page of the image
+// that holds a byte other than 0xFF.  A page found torn is programmed
+// again with the same bytes, which on NOR flash leaves the page as
+// programmed once.
+//
+// Ed25519 is not checked here.  The writer carries no key; the bootloader
+// verifies the signature of every image it is about to start, and refuses
+// one that fails (bootimg.check_signature).
+//
+// The staged header is held in a buffer of this module between
+// `accept_header` and `begin`, 520 bytes of `.bss` by the memory report.
+// Every function takes
+// the policy by address (`var`), also where it only reads it, so the
+// 32-byte key is not copied per call.  Nothing here allocates.
+
+use bytes32
+use bootimg
+use imghash
+
+// The bytes `program` takes at once, and the largest header.
+pub const PAGE_BYTES = 512
+
+// The slots of a `SlotDev`.
+pub const SLOT_A = 0
+pub const SLOT_B = 1
+
+// The answers.  0 is success; 1 to 10 are bootimg's IMG_* answers for a
+// header (IMG_UNSIGNED is 8, IMG_BAD_HASH is 7).
+pub const SLOT_OK = 0
+// Erasing slot B would remove the image the bootloader could go back to:
+// slot A is on trial and has not confirmed itself.
+pub const SLOT_BUSY = 20
+// The flash refused an erase or a program, or a byte read back differently.
+pub const SLOT_FLASH = 21
+// Nothing is staged in slot B, or what is staged has failed its trial.
+pub const SLOT_NOT_STAGED = 22
+// An offset or a length outside the image.
+pub const SLOT_RANGE = 23
+
+pub alias Page = Vec[u8; 512]
+
+// The two slots of a device, and the writes slot B takes.  The device is
+// also a `ByteSource`, which reads the slot it was made for.
+pub trait SlotDev[e]
+    // The device read as slot A, or as slot B: its `ByteSource` then
+    // answers that slot's bytes, from its start.
+    fn slot_a(self) -> Self [e]
+    fn slot_b(self) -> Self [e]
+    // The erase unit of slot B that holds `off`: its length, 0 when none.
+    fn unit_bytes(self, off: Int) -> Int [e]
+    // Erases the unit of slot B that holds `off`; 0 when it is erased.
+    fn erase_unit(self, off: Int) -> Int [e]
+    // Programs the bytes of `src` at `off` in slot B, a multiple of 4
+    // bytes at an offset that is one; 0 when they are written.
+    fn program(self, off: Int, var src: Page) -> Int [e]
+
+// The device read as slot A, or as slot B.  The result is declared the
+// device's type, which is how the effect check follows it.
+@tier(embedded)
+fn sa<D: SlotDev[e]>(dev: D) -> D [e]
+    dev.slot_a()
+
+@tier(embedded)
+fn sb<D: SlotDev[e]>(dev: D) -> D [e]
+    dev.slot_b()
+
+// ── The staged header ────────────────────────────────────────────────
+
+var head: Page = Vec.new()
+var head_ok = false
+
+// The header held for `begin`, as bytes.
+pub @value
+struct HeadSrc
+    base: Int
+    n: Int
+
+impl ByteSource[mutate] for HeadSrc
+    @tier(embedded)
+    fn src_len(self) -> Int [mutate]
+        self.n
+
+    @tier(embedded)
+    fn src_at(self, i: Int) -> Int [mutate]
+        let at = self.base + i
+        if at < 0 or at >= head.len()
+            return 0xFF
+        head[at] as Int
+
+    @tier(embedded)
+    fn src_window(self, off: Int, n: Int) -> HeadSrc [mutate]
+        HeadSrc { base: self.base + off, n: n }
+
+// Every check of a header but the hash and the signature, and the
+// unsigned bit against the signing policy.
+@tier(embedded)
+fn header_code<S: ByteSource[e]>(src: S, slot_bytes: Int, pol: Policy) -> Int [e]
+    let r = bootimg.check_header(src, slot_bytes, pol)
+    if r != IMG_OK
+        return r
+    if (bootimg.flags(src) & FLAG_UNSIGNED) != 0 and pol.signing_required
+        return IMG_UNSIGNED
+    IMG_OK
+
+// Checks the header in `buf`, the first `pol.header_bytes` bytes of an
+// image, and holds it for `begin`.  Answers IMG_OK, or the first check
+// the header fails; nothing is erased or written.
+pub @tier(embedded)
+fn accept_header<D: SlotDev[e] + ByteSource[f]>(dev: D, var pol: Policy, var buf: Page) -> Int [mutate, e, f]
+    head_ok = false
+    let hb = pol.header_bytes
+    if hb < 0x100 or hb > PAGE_BYTES or hb % 4 != 0 or buf.len() < hb
+        return IMG_BAD_HEADER
+    head.clear()
+    for i in 0..hb
+        var b = buf[i] as Int
+        // The state words are programmed when the update is committed,
+        // never from the header that arrived.
+        if i >= OFF_PENDING and i < OFF_PENDING + 12
+            b = 0xFF
+        let _ = head.push(b as u8)
+    let r = header_code(HeadSrc { base: 0, n: hb }, sb(dev).src_len(), pol)
+    if r == IMG_OK
+        head_ok = true
+    r
+
+// The version of the header `accept_header` holds, as major << 24 |
+// minor << 16 | patch.
+pub @tier(embedded)
+fn held_version(var pol: Policy) -> Int [mutate]
+    bootimg.version(HeadSrc { base: 0, n: pol.header_bytes })
+
+// ── Slot B ───────────────────────────────────────────────────────────
+
+// Whether erasing slot B would remove the image the bootloader could go
+// back to: slot A holds a header that was tried and has not confirmed,
+// and slot B holds an image that did not fail its own trial and whose
+// hash holds.
+@tier(embedded)
+fn revert_target<D: SlotDev[e] + ByteSource[f]>(dev: D, var pol: Policy) -> Bool [e, f]
+    let a: D = sa(dev)
+    if bootimg.check_header(a, a.src_len(), pol) != IMG_OK
+        return false
+    if not bootimg.is_tried(a) or bootimg.is_confirmed(a)
+        return false
+    let b: D = sb(dev)
+    if bootimg.check_header(b, b.src_len(), pol) != IMG_OK
+        return false
+    if bootimg.is_pending(b) and bootimg.is_tried(b) and not bootimg.is_confirmed(b)
+        return false
+    bootimg.check_hash(b)
+
+// Erases the units of slot B from its start through `total` bytes.
+@tier(embedded)
+fn erase_through<D: SlotDev[e]>(dev: D, total: Int) -> Int [e]
+    var off = 0
+    for _u in 0..4096
+        if off < total
+            if dev.erase_unit(off) != 0
+                return SLOT_FLASH
+            let u = dev.unit_bytes(off)
+            if u < 1
+                return SLOT_FLASH
+            off = off + u
+    SLOT_OK
+
+// Programs `src` at `off` of slot B and reads it back.
+@tier(embedded)
+fn write_checked<D: SlotDev[e] + ByteSource[f]>(dev: D, off: Int, var src: Page) -> Int [e, f]
+    if dev.program(off, var src) != 0
+        return SLOT_FLASH
+    let b: D = sb(dev)
+    for i in 0..src.len()
+        if b.src_at(off + i) != src[i] as Int
+            return SLOT_FLASH
+    SLOT_OK
+
+// Erases slot B and programs the header `accept_header` holds.  Answers
+// SLOT_NOT_STAGED when no header was accepted, SLOT_BUSY when slot B is
+// what the bootloader would revert to, SLOT_FLASH when the flash refused.
+pub @tier(embedded)
+fn begin<D: SlotDev[e] + ByteSource[f]>(dev: D, var pol: Policy) -> Int [mutate, e, f]
+    if not head_ok
+        return SLOT_NOT_STAGED
+    if revert_target(dev, var pol)
+        return SLOT_BUSY
+    head_ok = false
+    let hb = pol.header_bytes
+    let total = hb + bootimg.image_bytes(HeadSrc { base: 0, n: hb })
+    let rc = erase_through(dev, total)
+    if rc != SLOT_OK
+        return rc
+    write_checked(dev, 0, var head)
+
+// Erases the first unit of slot B, which ends what `begin` staged: the
+// header is gone and the bootloader sees an erased slot.  For a staged
+// image that failed its hash.  Answers SLOT_BUSY where `begin` would.
+pub @tier(embedded)
+fn abandon<D: SlotDev[e] + ByteSource[f]>(dev: D, var pol: Policy) -> Int [e, f]
+    if revert_target(dev, var pol)
+        return SLOT_BUSY
+    if dev.erase_unit(0) != 0
+        return SLOT_FLASH
+    SLOT_OK
+
+// Erases the whole of slot B, except where it holds the only image the
+// bootloader could revert to (SLOT_BUSY).
+pub @tier(embedded)
+fn erase<D: SlotDev[e] + ByteSource[f]>(dev: D, var pol: Policy) -> Int [e, f]
+    if revert_target(dev, var pol)
+        return SLOT_BUSY
+    erase_through(dev, sb(dev).src_len())
+
+// Whether slot B holds a header that `begin` wrote, or a whole image: a
+// valid header that has not failed a trial.  What the staged image's
+// transfer is resumed from.
+pub @tier(embedded)
+fn staged<D: SlotDev[e] + ByteSource[f]>(dev: D, var pol: Policy) -> Bool [e, f]
+    let b: D = sb(dev)
+    header_code(b, b.src_len(), pol) == IMG_OK and not bootimg.is_tried(b)
+
+// The image bytes of the staged image, 0 when none is staged.
+pub @tier(embedded)
+fn staged_bytes<D: SlotDev[e] + ByteSource[f]>(dev: D, var pol: Policy) -> Int [e, f]
+    if not staged(dev, var pol)
+        return 0
+    let b: D = sb(dev)
+    bootimg.image_bytes(b)
+
+// Whether the staged image is marked for the next boot.
+pub @tier(embedded)
+fn is_pending<D: SlotDev[e] + ByteSource[f]>(dev: D) -> Bool [e, f]
+    let b: D = sb(dev)
+    bootimg.is_pending(b)
+
+// Whether a page of slot B, `len` bytes from `base`, holds a byte other
+// than 0xFF.
+@tier(embedded)
+fn page_written<S: ByteSource[f]>(b: S, base: Int, len: Int) -> Bool [f]
+    for i in 0..len
+        if b.src_at(base + i) != 0xFF
+            return true
+    false
+
+// Where a transfer resumes: the image offset of the start of the last
+// 512-byte page that holds a byte other than 0xFF, 0 when none does, and
+// the whole image when it is already marked for the next boot.
+pub @tier(embedded)
+fn durable<D: SlotDev[e] + ByteSource[f]>(dev: D, var pol: Policy) -> Int [e, f]
+    let n = staged_bytes(dev, var pol)
+    if n == 0
+        return 0
+    if is_pending(dev)
+        return n
+    let b: D = sb(dev)
+    let hb = pol.header_bytes
+    var k = (n + PAGE_BYTES - 1) / PAGE_BYTES
+    // A bounded loop: images up to 4 MB.
+    for _p in 0..8192
+        if k > 0
+            let at = (k - 1) * PAGE_BYTES
+            var len = n - at
+            if len > PAGE_BYTES
+                len = PAGE_BYTES
+            if page_written(b, hb + at, len)
+                return at
+            k = k - 1
+    0
+
+// Programs `page` at image offset `off` of the staged image, padded with
+// 0xFF to a multiple of 4 bytes, and reads it back.  `off` is a multiple
+// of 4.  SLOT_NOT_STAGED when nothing is staged, SLOT_RANGE when the page
+// is outside the image, SLOT_FLASH when the flash refused or the bytes
+// read back differ.
+pub @tier(embedded)
+fn program<D: SlotDev[e] + ByteSource[f]>(dev: D, var pol: Policy, off: Int, var page: Page) -> Int [e, f]
+    let n = staged_bytes(dev, var pol)
+    if n == 0
+        return SLOT_NOT_STAGED
+    let len = page.len()
+    if off < 0 or off % 4 != 0 or len < 1 or off + len > n
+        return SLOT_RANGE
+    for _p in 0..3
+        if page.len() % 4 != 0
+            let _ = page.push(0xFF as u8)
+    write_checked(dev, pol.header_bytes + off, var page)
+
+// Checks the whole staged image against the header's SHA-256 and
+// programs the pending word.  Answers SLOT_OK also when the word is
+// already programmed, so a commit whose answer was lost is asked again.
+// IMG_BAD_HASH when the image is not the one the header names,
+// SLOT_NOT_STAGED when nothing is staged.
+pub @tier(embedded)
+fn commit<D: SlotDev[e] + ByteSource[f]>(dev: D, var pol: Policy) -> Int [e, f]
+    if not staged(dev, var pol)
+        return SLOT_NOT_STAGED
+    let b: D = sb(dev)
+    if bootimg.is_pending(b)
+        return SLOT_OK
+    if not bootimg.check_hash(b)
+        return IMG_BAD_HASH
+    var w: Page = Vec.new()
+    for i in 0..4
+        let _ = w.push(((STATE_PENDING >> (8 * i)) & 0xFF) as u8)
+    write_checked(dev, OFF_PENDING, var w)
+
+// ── The report ───────────────────────────────────────────────────────
+
+// What a slot's header says.  `valid` is the header's checks, not the
+// hash: `slot_info` with `verify` also hashes the image.
+pub @value
+struct SlotInfo
+    valid: Bool
+    version: Int
+    pending: Bool
+    tried: Bool
+    confirmed: Bool
+    hash: B32
+
+// The header of slot `slot` as the bootloader reads it.  With `verify`
+// the SHA-256 of the image must also hold for `valid`.
+pub @tier(embedded)
+fn slot_info<D: SlotDev[e] + ByteSource[f]>(dev: D, var pol: Policy, slot: Int, verify: Bool) -> SlotInfo [e, f]
+    var s: D = sa(dev)
+    if slot == SLOT_B
+        s = sb(dev)
+    var ok = bootimg.check_header(s, s.src_len(), pol) == IMG_OK
+    if ok and verify
+        ok = bootimg.check_hash(s)
+    var h = bytes32.b32_zero()
+    if ok
+        for i in 0..32
+            h.put(i, s.src_at(0x20 + i))
+    SlotInfo { valid: ok, version: bootimg.version(s), pending: bootimg.is_pending(s),
+               tried: bootimg.is_tried(s), confirmed: bootimg.is_confirmed(s), hash: h }

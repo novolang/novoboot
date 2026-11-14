@@ -1,0 +1,53 @@
+// hostimg.nv: a slot image built on the host, for the suites that stage
+// one.
+//
+// `image` writes what `novo build --role=application` stamps (bootimg.nv
+// has the layout): the header with the image's SHA-256 and its CRC-32C,
+// then the payload.  The state words are erased.  The header is unsigned
+// or carries 64 zero bytes where the signature goes; nothing here signs,
+// so the image is one the writer accepts and the bootloader would refuse
+// where it checks a signature.
+//
+// Every function is `@tier(app)`: a device build leaves them out.
+
+use std.bytes
+use bytes32
+use imghash
+use hostsrc
+use crc
+
+@tier(app)
+fn put32(var h: [Int], at: Int, v: Int)
+    for i in 0..4
+        h[at + i] = (v >> (8 * i)) & 0xFF
+
+// An image of `payload` for the chip `chip` and the board `board`, with a
+// header of `header_bytes` bytes, version `version` (major << 24 | minor
+// << 16 | patch) and build id `build`.
+pub @tier(app)
+fn image(chip: Int, board: Int, header_bytes: Int, version: Int, build: Int, unsigned: Bool,
+         payload: Bytes) -> Bytes
+    var h: [Int] = []
+    for i in 0..header_bytes
+        list.push(h, if i < 0x84 then 0 else 0xFF)
+    put32(var h, 0x00, HEADER_MAGIC)
+    h[0x04] = HEADER_VERSION
+    h[0x06] = header_bytes & 0xFF
+    h[0x07] = (header_bytes >> 8) & 0xFF
+    put32(var h, 0x08, bytes.len(payload))
+    h[0x0C] = (version >> 24) & 0xFF
+    h[0x0D] = (version >> 16) & 0xFF
+    h[0x0E] = version & 0xFF
+    h[0x0F] = (version >> 8) & 0xFF
+    put32(var h, 0x10, build)
+    put32(var h, 0x14, chip)
+    put32(var h, 0x18, board)
+    put32(var h, 0x1C, if unsigned then FLAG_UNSIGNED else 0)
+    let sha = imghash.sha256_of(hostsrc.bytes_src(payload))
+    for i in 0..32
+        h[0x20 + i] = sha.at(i)
+    var c = crc.crc32c_start()
+    for i in 0..0x80
+        c = crc.crc32c_step(c, h[i])
+    put32(var h, 0x80, crc.crc32c_finish(c))
+    bytes.from_byte_list(h) + payload

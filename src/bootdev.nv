@@ -1,0 +1,110 @@
+// bootdev.nv: the board's two slots as the device the slot writer
+// (bootslot.nv) writes through.
+//
+// `BoardSlots` is a `SlotDev` and a `ByteSource` for a board whose
+// manifest has a `[flash]` table with the A/B layout.  A read is the
+// core reading the slot's memory (`hw.mem_read8`, as the bootloader reads
+// it); an erase and a program go through `hal.boot`, which refuses every
+// address outside the two slots, the swap area and the status region, and
+// which the slot writer reaches in slot B only (docs/embedded/bootloader.md,
+// `hal.boot`).
+//
+// A program is `hal.boot.write_word`, a word at a time, skipping the words
+// that are all ones, since programming them changes nothing, and the words
+// that already hold the value.  The writer reads every page back.
+//
+// The board's numbers come from its `[flash]` table, through
+// `bsp.board.flash_*`, which exist only in a build for a board with the
+// table.  This module does not call them, so that the package still
+// builds on the host: the program does, and hands them to `slots` and
+// `policy`:
+//
+//   let dev = bootdev.slots(bsp.board.flash_slot_a_start(), bsp.board.flash_slot_a_bytes(),
+//                           bsp.board.flash_slot_b_start(), bsp.board.flash_slot_b_bytes())
+//   var pol = bootdev.policy(bsp.board.flash_header_bytes(), bsp.board.flash_chip_id(),
+//                            bsp.board.flash_board_id(), bsp.board.flash_signing_required())
+//
+// The policy carries no key, since the writer does not check a signature.
+
+use bytes32
+use bootimg
+use bootslot
+
+// The board's slots, and the slot or window the value reads.
+pub @value
+struct BoardSlots
+    a_start: Int
+    a_bytes: Int
+    b_start: Int
+    b_bytes: Int
+    slot: Int
+    base: Int
+    n: Int
+
+// The slots at these addresses, read as slot B: the value the `bootslot`
+// functions take.
+pub @tier(embedded)
+fn slots(a_start: Int, a_bytes: Int, b_start: Int, b_bytes: Int) -> BoardSlots []
+    BoardSlots { a_start: a_start, a_bytes: a_bytes, b_start: b_start, b_bytes: b_bytes,
+                 slot: SLOT_B, base: 0, n: b_bytes }
+
+// What an image for the board must match: the header size, the chip
+// identity word and the board id the table gives, and `required` as its
+// `signing` key is 1 for "required".
+pub @tier(embedded)
+fn policy(header_bytes: Int, chip: Int, board: Int, required: Int) -> Policy []
+    Policy { header_bytes: header_bytes, chip: chip, board: board, signing_required: required == 1,
+             key_present: false, key: bytes32.b32_zero() }
+
+// cov: skip — a read is the core reading the slot's memory (hw.mem_read8), which only a board maps; tests/slot_probe.nv builds it and the bench runs it
+impl ByteSource[hw] for BoardSlots
+    @tier(embedded)
+    fn src_len(self) -> Int [hw]
+        self.n
+
+    @tier(embedded)
+    fn src_at(self, i: Int) -> Int [hw]
+        var start = self.b_start
+        if self.slot == SLOT_A
+            start = self.a_start
+        hw.mem_read8(start + self.base + i)
+
+    @tier(embedded)
+    fn src_window(self, off: Int, n: Int) -> BoardSlots [hw]
+        BoardSlots { a_start: self.a_start, a_bytes: self.a_bytes, b_start: self.b_start,
+                     b_bytes: self.b_bytes, slot: self.slot, base: self.base + off, n: n }
+
+// cov: skip — an erase and a program are hal.boot, which is the board's flash driver; tests/slot_probe.nv builds it and the bench runs it
+impl SlotDev[hw] for BoardSlots
+    @tier(embedded)
+    fn slot_a(self) -> BoardSlots [hw]
+        BoardSlots { a_start: self.a_start, a_bytes: self.a_bytes, b_start: self.b_start,
+                     b_bytes: self.b_bytes, slot: SLOT_A, base: 0, n: self.a_bytes }
+
+    @tier(embedded)
+    fn slot_b(self) -> BoardSlots [hw]
+        BoardSlots { a_start: self.a_start, a_bytes: self.a_bytes, b_start: self.b_start,
+                     b_bytes: self.b_bytes, slot: SLOT_B, base: 0, n: self.b_bytes }
+
+    @tier(embedded)
+    fn unit_bytes(self, off: Int) -> Int [hw]
+        hal.boot.unit_bytes(self.b_start + off)
+
+    @tier(embedded)
+    fn erase_unit(self, off: Int) -> Int [hw]
+        hal.boot.erase(self.b_start + off)
+
+    @tier(embedded)
+    fn program(self, off: Int, var src: Page) -> Int [hw]
+        let at = self.b_start + off
+        for k in 0..src.len() / 4
+            let w = src[4 * k] as Int | (src[4 * k + 1] as Int << 8) | (src[4 * k + 2] as Int << 16)
+                | (src[4 * k + 3] as Int << 24)
+            // A word already holding what is to be written is left: a
+            // page sent again after a reset is not written over, and a
+            // word is not written more often than the flash allows.
+            if w != 0xFFFFFFFF and hw.mem_read32(at + 4 * k) != w
+                let rc = hal.boot.write_word(at + 4 * k, w)
+                if rc != 0
+                    return rc
+        0
