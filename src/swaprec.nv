@@ -75,18 +75,22 @@ struct Layout
     slot_bytes: Int
 
 @tier(embedded)
+// cov: skip — runs on a board only: it reads or writes the board's flash (hw.mmio_read, hal.boot); tests/board_boot.sh runs it
 fn word(lay: Layout, off: Int) -> Int [hw]
     hw.mmio_read(lay.st + off, 32)
 
 @tier(embedded)
+// cov: skip — runs on a board only: it reads or writes the board's flash (hw.mmio_read, hal.boot); tests/board_boot.sh runs it
 fn put(lay: Layout, off: Int, w: Int) -> Int [hw]
     hal.boot.write_word(lay.st + off, w)
 
 @tier(embedded)
+// cov: skip — runs on a board only: it reads or writes the board's flash (hw.mmio_read, hal.boot); tests/board_boot.sh runs it
 fn say(s: Str) [hw]
     hal.uart.write(s)
 
 @tier(embedded)
+// cov: skip — runs on a board only: it reads or writes the board's flash (hw.mmio_read, hal.boot); tests/board_boot.sh runs it
 fn say_int(n: Int) [hw]
     var div = 1
     for _d in 0..9
@@ -98,6 +102,7 @@ fn say_int(n: Int) [hw]
             div = div / 10
 
 @tier(embedded)
+// cov: skip — runs on a board only: it reads or writes the board's flash (hw.mmio_read, hal.boot); tests/board_boot.sh runs it
 fn say_kv(name: Str, v: Int) [hw]
     say(name)
     say("=")
@@ -106,8 +111,8 @@ fn say_kv(name: Str, v: Int) [hw]
 
 // The cut, at point `p` of a swap this boot started.
 @tier(embedded)
+// cov: skip — the body runs only in the bench's cut builds, and the core resets before a probe can read the coverage table
 fn cut(p: Int, fresh: Bool) [hw]
-    // cov: skip — the body runs only in the bench's cut builds, and the core resets before a probe can read the coverage table
     if fresh and p == CUT_AT
         say_kv("cut", p)
         hal.timer.delay_ms(1000)
@@ -119,13 +124,13 @@ fn cut(p: Int, fresh: Bool) [hw]
 
 // Erases the units of [addr, addr + n).
 @tier(embedded)
+// cov: skip — runs on a board only: it reads or writes the board's flash (hw.mmio_read, hal.boot); tests/board_boot.sh runs it
 pub fn erase_range(addr: Int, n: Int) -> Int [hw]
     var off = 0
     for _u in 0..1024
         if off < n
             let rc = hal.boot.erase(addr + off)
             if rc != 0
-                // cov: skip — runs only when the flash refuses an erase inside a slot, which a healthy chip never does
                 return rc
             off = off + hal.boot.unit_bytes(addr + off)
     0
@@ -133,6 +138,7 @@ pub fn erase_range(addr: Int, n: Int) -> Int [hw]
 // The number of erase units in the first `n` bytes of slot A, and the
 // offset of unit `u` in a slot; both slots have the same units.
 @tier(embedded)
+// cov: skip — runs on a board only: it reads or writes the board's flash (hw.mmio_read, hal.boot); tests/board_boot.sh runs it
 fn units_in(lay: Layout, n: Int) -> Int [hw]
     let a = lay.a
     var off = 0
@@ -144,6 +150,7 @@ fn units_in(lay: Layout, n: Int) -> Int [hw]
     k
 
 @tier(embedded)
+// cov: skip — runs on a board only: it reads or writes the board's flash (hw.mmio_read, hal.boot); tests/board_boot.sh runs it
 fn unit_offset(lay: Layout, u: Int) -> Int [hw]
     let a = lay.a
     var off = 0
@@ -153,12 +160,14 @@ fn unit_offset(lay: Layout, u: Int) -> Int [hw]
 
 // Whether the image in the swap area's first unit failed its trial: pending, tried and not confirmed.
 @tier(embedded)
+// cov: skip — runs on a board only: it reads or writes the board's flash (hw.mmio_read, hal.boot); tests/board_boot.sh runs it
 fn failed_trial(lay: Layout) -> Bool [hw]
     hw.mmio_read(lay.sw + OFF_PENDING, 32) == STATE_PENDING and hw.mmio_read(lay.sw + OFF_TRIED, 32) == STATE_TRIED
         and hw.mmio_read(lay.sw + OFF_CONFIRMED, 32) != STATE_CONFIRMED
 
 // Copies the bytes [from, to) of a unit from `src` to `dst`, leaving the three state words out when `skip` is set.
 @tier(embedded)
+// cov: skip — runs on a board only: it reads or writes the board's flash (hw.mmio_read, hal.boot); tests/board_boot.sh runs it
 fn copy_span(dst: Int, src: Int, from: Int, to: Int, skip: Bool) -> Int [hw]
     let lo = OFF_PENDING
     let hi = OFF_PENDING + 12
@@ -174,6 +183,7 @@ fn copy_span(dst: Int, src: Int, from: Int, to: Int, skip: Bool) -> Int [hw]
 
 // Step `i`: erase its destination, then copy its source in two halves.
 @tier(embedded)
+// cov: skip — runs on a board only: it reads or writes the board's flash (hw.mmio_read, hal.boot); tests/board_boot.sh runs it
 fn step(lay: Layout, i: Int, fresh: Bool) -> Int [hw]
     let off = unit_offset(lay, i / 3)
     let a = lay.a + off
@@ -201,12 +211,14 @@ fn step(lay: Layout, i: Int, fresh: Bool) -> Int [hw]
 
 // Erases the status region.
 @tier(embedded)
+// cov: skip — runs on a board only: it reads or writes the board's flash (hw.mmio_read, hal.boot); tests/board_boot.sh runs it
 fn clear(lay: Layout) -> Int [hw]
     erase_range(lay.st, lay.st_bytes)
 
 // The steps from `first` to the last, each word written before its step,
 // then the complete word, the magic cleared and the region erased.
 @tier(embedded)
+// cov: skip — runs on a board only: it reads or writes the board's flash (hw.mmio_read, hal.boot); tests/board_boot.sh runs it
 fn run(lay: Layout, n: Int, first: Int, fresh: Bool) -> Int [hw]
     let steps = 3 * units_in(lay, n)
     var rc = 0
@@ -218,7 +230,6 @@ fn run(lay: Layout, n: Int, first: Int, fresh: Bool) -> Int [hw]
         if rc == 0
             rc = step(lay, i, fresh)
     if rc != 0
-        // cov: skip — runs only when the flash refuses an erase or a write inside a slot, which a healthy chip never does
         return rc
     put(lay, 0x0C, REC_DONE)
     cut(10000, fresh)
@@ -230,6 +241,7 @@ fn run(lay: Layout, n: Int, first: Int, fresh: Bool) -> Int [hw]
 // Exchanges slot A and slot B over their first `n` bytes, through the
 // swap area, recording each step.
 @tier(embedded)
+// cov: skip — runs on a board only: it reads or writes the board's flash (hw.mmio_read, hal.boot); tests/board_boot.sh runs it
 pub fn swap(lay: Layout, n: Int) -> Int [hw]
     let units = units_in(lay, n)
     let span = unit_offset(lay, units)
@@ -241,7 +253,6 @@ pub fn swap(lay: Layout, n: Int) -> Int [hw]
     if rc == 0
         rc = put(lay, 0x00, REC_MAGIC)
     if rc != 0
-        // cov: skip — runs only when the flash refuses an erase or a write of the status region, which a healthy chip never does
         return rc
     say_kv("swap bytes", span)
     cut(9999, true)
@@ -250,6 +261,7 @@ pub fn swap(lay: Layout, n: Int) -> Int [hw]
 // Whether the status region holds a live record: the magic, and n and
 // its inverse agreeing, n inside a slot.
 @tier(embedded)
+// cov: skip — runs on a board only: it reads or writes the board's flash (hw.mmio_read, hal.boot); tests/board_boot.sh runs it
 fn live(lay: Layout) -> Bool [hw]
     let n = word(lay, 0x04)
     word(lay, 0x00) == REC_MAGIC and (n ^ word(lay, 0x08)) == 0xFFFFFFFF and n > 0
@@ -260,6 +272,7 @@ fn live(lay: Layout) -> Bool [hw]
 // record whose swap had finished is cleared.  Answers 1 when it finished
 // a swap, 0 when there was none, and the flash's refusal otherwise.
 @tier(embedded)
+// cov: skip — runs on a board only: it reads or writes the board's flash (hw.mmio_read, hal.boot); tests/board_boot.sh runs it
 pub fn resume(lay: Layout) -> Int [hw]
     if not live(lay)
         return 0
@@ -280,6 +293,5 @@ pub fn resume(lay: Layout) -> Int [hw]
         put(lay, REC_STEPS, REC_STEP)
     let rc = run(lay, n, last, false)
     if rc != 0
-        // cov: skip — runs only when the flash refuses an erase or a write, which a healthy chip never does
         return rc
     1

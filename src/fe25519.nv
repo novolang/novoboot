@@ -165,7 +165,6 @@ pub fn fe_to_bytes(var out: B32, var f: Fe)
     for i in 1..10
         if h.v[i] != (1 << width(i)) - 1
             full = false
-    // cov: skip — the body runs only for a result from p to 2^255 - 1 after the carries, about 1 in 2^250 of the values the check computes
     if full
         h.put(0, h.v[0] - ((1 << 26) - 19))
         for i in 1..10

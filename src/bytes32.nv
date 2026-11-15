@@ -23,6 +23,7 @@ struct FlashRange
     base: Int
     n: Int
 
+// cov: skip — a read is the core reading the chip's flash as memory (hw.mem_read8), which only a board maps
 impl ByteSource[hw] for FlashRange
     @tier(embedded)
     fn src_len(self) -> Int [hw]

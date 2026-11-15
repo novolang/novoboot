@@ -165,7 +165,6 @@ pub fn ge_decode(var r: Ge, var s: B32) -> Bool
         let want = if i == 31 then (s.b[31] as Int) & 127 else s.b[i] as Int
         same = same and back.b[i] as Int == want
     if not same
-        // cov: skip — runs only for a key whose y is p or above; the bootloader's key is the build's, a canonical encoding by construction, and the host vectors refuse such a key
         return false
     var one = fe25519.fe_one()
     var u = fe25519.fe_zero()
@@ -194,7 +193,6 @@ pub fn ge_decode(var r: Ge, var s: B32) -> Bool
     let root = fe25519.fe_eq(var vxx, var u)
     fe25519.fe_neg(var t, var u)
     if not root and not fe25519.fe_eq(var vxx, var t)
-        // cov: skip — runs only for a key that is not a curve point; the bootloader's key is the build's public key, a point by construction
         return false
     if not root
         var m = fe25519.fe_sqrtm1()
@@ -381,7 +379,6 @@ pub fn verify<S: ByteSource[e]>(pk: B32, sig: B64, msg: S) -> Bool [e]
         return false
     var a = ge_identity()
     if not ge_decode(var a, var key)
-        // cov: skip — runs only for a key that does not decode, which the bootloader's built-in key always does
         return false
     ge_neg(var a, var a)
     var h = bytes32.b64_zero()

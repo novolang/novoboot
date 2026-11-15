@@ -1,0 +1,149 @@
+// image_tests: the bootloader's checks of one slot image that the test
+// carries, run on the host with the same code the device runs.
+//
+//   novo test tests/image_tests.nv
+//
+// The image is a header of 256 bytes and an image of 32 bytes, made once
+// by tests/imgtool.py's layout and signed with the Ed25519 key whose
+// private half is the bytes 0 to 31; the public half is KEY_HEX.  Each
+// case changes some bytes of it and, where the change is to a field the
+// header's CRC covers, writes the CRC again, so that the check under test
+// is the one that answers.  tests/header_tests.nv checks the images the
+// toolchain stamps, when tests/orbit/test_novoboot.sh gives it a folder
+// of them; this suite needs nothing outside the package.
+
+use std.test
+use std.bytes
+use bytes32
+use bootimg
+use hostsrc
+
+let SLOT_BYTES = 4096
+let HEADER_BYTES = 256
+let CHIP = 0x413
+let BOARD = 0x96A06A37
+
+let KEY_HEX = "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8"
+
+fn image_hex() -> Str
+    str.join([
+        "4e4f56420100000120000000010203000700000013040000376aa09600000000ab5f8b5cb9435354c7b58603592d5faf",
+        "081e17ceb05f7a7c67f4b666f12ca457bec83631a35a11dbdb058f800fd7a04fb1bbfe8c98632183d32a1b6e6b3aacc5",
+        "915ba809ef5271231397b675cd2442c7872caf4233bb0c2d189e6c3a5369990dea559bf4ffffffffffffffffffffffff",
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "ffffffffffffffffffffffffffffffff030a11181f262d343b424950575e656c737a81888f969da4abb2b9c0c7ced5dc"
+    ], "")
+
+fn image() -> Bytes
+    bytes.from_hex(image_hex()) ?? bytes.zeros(0)
+
+fn key() -> B32
+    let h = bytes.from_hex(KEY_HEX) ?? bytes.zeros(32)
+    var k = bytes32.b32_zero()
+    for i in 0..32
+        k.put(i, bytes.byte_at(h, i) ?? 0)
+    k
+
+fn policy(required: Bool, with_key: Bool) -> Policy
+    Policy { header_bytes: HEADER_BYTES, chip: CHIP, board: BOARD, signing_required: required,
+             key_present: with_key, key: key() }
+
+// The answer of the whole check to `img`.
+fn check(img: Bytes, required: Bool, with_key: Bool) -> Str
+    bootimg.result_name(bootimg.check_slot(hostsrc.bytes_src(img), SLOT_BYTES, policy(required, with_key)))
+
+// `img` with the byte at `off` replaced, the header's CRC left as it was.
+fn put(img: Bytes, off: Int, v: Int) -> Bytes
+    var out = bytes.clone(img)
+    out = bytes.set_u8(out, off, v)
+    out
+
+// `img` with the header's CRC written again.
+fn recrc(img: Bytes) -> Bytes
+    let c = bootimg.header_crc(hostsrc.bytes_src(img))
+    var out = bytes.clone(img)
+    for j in 0..4
+        out = bytes.set_u8(out, 0x80 + j, (c >> (8 * j)) & 255)
+    out
+
+// `img` with the byte at `off` replaced and the CRC written again.
+fn patch(img: Bytes, off: Int, v: Int) -> Bytes
+    recrc(put(img, off, v))
+
+@test
+fn test_signed_image()
+    let img = image()
+    test.assert_eq_str(check(img, true, true), "ok")
+    test.assert_eq_str(check(img, false, true), "ok")
+    test.assert_eq_str(check(img, true, false), "no key")
+    test.assert_eq_str(check(img, false, false), "no key")
+
+@test
+fn test_unsigned_image()
+    let img = patch(image(), 0x1C, 1)
+    test.assert_eq_str(check(img, false, true), "ok")
+    test.assert_eq_str(check(img, false, false), "ok")
+    test.assert_eq_str(check(img, true, true), "unsigned")
+
+@test
+fn test_signature_refused()
+    test.assert_eq_str(check(patch(image(), 0x50, 0x5A), true, true), "bad signature")
+    test.assert_eq_str(check(patch(image(), 0x20, 0), true, true), "bad hash")
+
+@test
+fn test_image_changed()
+    let img = image()
+    test.assert_eq_str(check(put(img, 0x11F, 0), false, true), "bad hash")
+    test.assert_eq_str(check(put(img, 0x10, 9), false, true), "bad header crc")
+    test.assert_eq_str(check(put(img, 0, 0xFF), false, true), "empty")
+
+@test
+fn test_header_refused()
+    let img = image()
+    test.assert_eq_str(check(patch(img, 0x04, 2), false, true), "bad header")
+    test.assert_eq_str(check(patch(img, 0x07, 2), false, true), "bad header")
+    test.assert_eq_str(check(patch(img, 0x0B, 0x7F), false, true), "bad size")
+    test.assert_eq_str(check(patch(img, 0x14, 0x12), false, true), "wrong chip")
+    test.assert_eq_str(check(patch(img, 0x18, 0x12), false, true), "wrong board")
+
+@test
+fn test_fields()
+    let img = image()
+    let src = hostsrc.bytes_src(img)
+    test.assert_eq(bootimg.magic(src), bootimg.HEADER_MAGIC, "the magic")
+    test.assert_eq(bootimg.header_bytes(src), HEADER_BYTES, "the header's size")
+    test.assert_eq(bootimg.image_bytes(src), 32, "the image's size")
+    test.assert_eq(bootimg.flags(src), 0, "signed")
+    test.assert_eq(bootimg.version(src), (1 << 24) | (2 << 16) | 3, "the version, 1.2.3")
+    test.assert_false(bootimg.is_pending(src), "not pending")
+    test.assert_false(bootimg.is_tried(src), "not tried")
+    test.assert_false(bootimg.is_confirmed(src), "not confirmed")
+
+@test
+fn test_state_words()
+    var img = image()
+    for j in 0..4
+        img = bytes.set_u8(img, bootimg.OFF_PENDING + j, (bootimg.STATE_PENDING >> (8 * j)) & 255)
+        img = bytes.set_u8(img, bootimg.OFF_TRIED + j, (bootimg.STATE_TRIED >> (8 * j)) & 255)
+        img = bytes.set_u8(img, bootimg.OFF_CONFIRMED + j, (bootimg.STATE_CONFIRMED >> (8 * j)) & 255)
+    let src = hostsrc.bytes_src(img)
+    test.assert_true(bootimg.is_pending(src), "pending")
+    test.assert_true(bootimg.is_tried(src), "tried")
+    test.assert_true(bootimg.is_confirmed(src), "confirmed")
+    // The words are outside the CRC and the hash: the image still passes.
+    test.assert_eq_str(check(img, true, true), "ok")
+
+@test
+fn test_result_names()
+    test.assert_eq_str(bootimg.result_name(bootimg.IMG_OK), "ok")
+    test.assert_eq_str(bootimg.result_name(bootimg.IMG_EMPTY), "empty")
+    test.assert_eq_str(bootimg.result_name(bootimg.IMG_BAD_CRC), "bad header crc")
+    test.assert_eq_str(bootimg.result_name(bootimg.IMG_BAD_HEADER), "bad header")
+    test.assert_eq_str(bootimg.result_name(bootimg.IMG_BAD_SIZE), "bad size")
+    test.assert_eq_str(bootimg.result_name(bootimg.IMG_WRONG_CHIP), "wrong chip")
+    test.assert_eq_str(bootimg.result_name(bootimg.IMG_WRONG_BOARD), "wrong board")
+    test.assert_eq_str(bootimg.result_name(bootimg.IMG_BAD_HASH), "bad hash")
+    test.assert_eq_str(bootimg.result_name(bootimg.IMG_UNSIGNED), "unsigned")
+    test.assert_eq_str(bootimg.result_name(bootimg.IMG_BAD_SIGNATURE), "bad signature")
+    test.assert_eq_str(bootimg.result_name(bootimg.IMG_NO_KEY), "no key")
