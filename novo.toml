@@ -1,6 +1,6 @@
 [package]
 name        = "novoboot"
-version     = "0.2.0"
+version     = "0.2.1"
 main        = "src/main.nv"
 description = "A bootloader in novo-lang for boards with a [flash] table: it checks the image header of each slot (CRC-32C, the chip and board, SHA-256 of the image, an Ed25519 signature), runs the A/B rule with the copy into the first slot, and starts the image.  The header, the hash and the signature check are modules a host shares, and bootslot.nv is the writer an application uses to stage an update into the second slot and mark it for the next start."
 license     = "Apache-2.0"
@@ -8,6 +8,8 @@ category    = "embedded"
 layer       = "host"
 stability   = "experimental"
 keywords    = ["embedded", "bootloader", "ed25519", "sha256", "firmware-update"]
+repository  = "https://github.com/novolang/novoboot"
+maintainers = ["novo-lang"]
 
 [dependencies]
 # The CRC-32C a header carries, from crc-nv's functions that need no

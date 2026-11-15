@@ -4,7 +4,7 @@ All notable changes to novoboot are recorded here.  This package follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html) with the
 pre-1.0 rule that a breaking change bumps the MINOR number.
 
-## [Unreleased]
+## [0.2.1] — 2026-11-15
 
 ### Added
 
