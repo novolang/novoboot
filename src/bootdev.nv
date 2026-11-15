@@ -9,9 +9,11 @@
 // which the slot writer reaches in slot B only (docs/embedded/bootloader.md,
 // `hal.boot`).
 //
-// A program is `hal.boot.write_word`, a word at a time, skipping the words
-// that are all ones, since programming them changes nothing, and the words
-// that already hold the value.  The writer reads every page back.
+// A program is one `hal.boot.copy` of the page, which writes it in one window of the flash driver.  `write_word` costs the driver's write
+// enable, commit and write disable at each word (146 microseconds on the nRF54LM20, 36 milliseconds for the 984 bytes of an upload request),
+// and the copy takes the three once.  It reads the page where it lies, so it needs the address of the page's octets; the layout of a `Vec`
+// that gives it is checked at each page, and a page is written a word at a time, skipping the words that are all ones and the words that already hold
+// the value, if the check fails.  The writer reads every page back.
 //
 // The board's numbers come from its `[flash]` table, through
 // `bsp.board.flash_*`, which exist only in a build for a board with the
@@ -74,6 +76,26 @@ impl ByteSource[hw] for BoardSlots
         BoardSlots { a_start: self.a_start, a_bytes: self.a_bytes, b_start: self.b_start,
                      b_bytes: self.b_bytes, slot: self.slot, base: self.base + off, n: n }
 
+// The octets of a `Page` follow its 8-octet length.
+const PAGE_DATA_AT = 8
+
+// cov: skip — the address of a page's octets is read from memory, which only a board maps; tests/slot_probe.nv builds it and the bench runs it
+// The address of the octets of a page: `addr_of` of a `var` parameter answers the slot that holds the struct's address.
+@no_alloc
+@tier(embedded)
+fn page_addr(var src: Page) -> Int [hw]
+    hw.mem_read32(addr_of(src)) + PAGE_DATA_AT
+
+// cov: skip — reads the layout of a page through the core, as page_addr does; the bench runs it
+// Whether a page's octets are where `PAGE_DATA_AT` says: the first eight octets of a page just filled, read as two words, are what was
+// written (as `pdu_mem.nv` of the nRF54 blocks checks for a PDU).  A check at each page costs a few microseconds and keeps the module free of state.
+@tier(embedded)
+fn page_layout_ok() -> Bool [hw]
+    var p: Page = Vec.new()
+    for i in 0..8
+        let _ = p.push((i + 1) as u8)
+    hw.mem_read32(page_addr(var p)) == 0x04030201 and hw.mem_read32(page_addr(var p) + 4) == 0x08070605
+
 // cov: skip — an erase and a program are hal.boot, which is the board's flash driver; tests/slot_probe.nv builds it and the bench runs it
 impl SlotDev[hw] for BoardSlots
     @tier(embedded)
@@ -97,6 +119,8 @@ impl SlotDev[hw] for BoardSlots
     @tier(embedded)
     fn program(self, off: Int, var src: Page) -> Int [hw]
         let at = self.b_start + off
+        if page_layout_ok() and src.len() % 4 == 0
+            return hal.boot.copy(at, page_addr(var src), src.len())
         for k in 0..src.len() / 4
             let w = src[4 * k] as Int | (src[4 * k + 1] as Int << 8) | (src[4 * k + 2] as Int << 16)
                 | (src[4 * k + 3] as Int << 24)

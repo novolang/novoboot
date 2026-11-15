@@ -4,6 +4,12 @@ All notable changes to novoboot are recorded here.  This package follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html) with the
 pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## [Unreleased]
+
+### Changed
+
+- `bootdev.BoardSlots.program` writes a page with one `hal.boot.copy`, where it called `hal.boot.write_word` at each word.  A word cost the flash driver's write enable, commit and write disable (146 microseconds on the nRF54LM20, 36 milliseconds for the 984 bytes of an upload request in the firmware update demo), and the copy takes them once for the page: 2.6 milliseconds a page with the buffered driver of the board support package, 7.8 milliseconds for a whole request.  It reads the page where it lies, so it checks at each page that a `Vec`'s octets follow its 8-octet length (as `pdu_mem.nv` of the nRF54 blocks does), and falls back to the word loop if they do not.  The board run of `tests/board_boot.sh` is the check; the host has no flash to program.  Filed with the driver as `bugs/orbit/rram-driver-stores-unbuffered.md`.
+
 ## [0.2.1] — 2026-11-15
 
 ### Added
