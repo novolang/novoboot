@@ -6,6 +6,15 @@ pre-1.0 rule that a breaking change bumps the MINOR number.
 
 ## [Unreleased]
 
+### Added
+
+- `bootslot.whole` says whether slot B holds a whole image and not the part of one that a transfer has written so far.  The header is the first
+  page a transfer writes, so a header that passes its checks says nothing of the bytes after it.  An image is whole when its header passes the checks
+  and its pending or tried word is programmed, or the last page of the image holds a byte other than 0xFF; the pages are written in order, so
+  the last one is written when all of them are.  It reads one page at most, where the hash reads the whole image.  A power cut inside the
+  programming of the last page leaves a page written in part that counts as written, and `commit` and the bootloader refuse that image by its hash.
+  `tests/bootslot_tests.nv` has the case.  mcumgr-nv 0.1.2 lists slot 1 by it.
+
 ### Fixed
 
 - A swap puts the image that leaves slot A into slot B with its three state words erased (pending, tried, confirmed), unless that image

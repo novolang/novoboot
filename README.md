@@ -26,6 +26,7 @@ calls to stage an update.  It writes slot B and nothing else.
 | `begin` | Erases slot B unit by unit through the end of the image, unless it holds the only image the bootloader could revert to (`SLOT_BUSY`), and programs the header with its three state words erased. |
 | `program` | Programs a page of the image at an offset and reads it back. |
 | `durable` | The image offset to resume from: the start of the last 512-byte page that holds a byte other than 0xFF.  The device keeps no record; slot B is the record. |
+| `whole` | Whether slot B holds a whole image and not the part of one a transfer has written so far: its header passes the checks and the image is marked, or the last page of the image holds a byte other than 0xFF.  Reads one page where the hash reads the image. |
 | `commit` | Checks the SHA-256 of the whole image against the header and programs the pending word.  The bootloader's next start swaps the slots and tries the image. |
 | `abandon`, `erase` | Erase the first unit, or all, of slot B, with the same guard as `begin`. |
 | `staged`, `staged_bytes`, `is_pending`, `slot_info` | What slot B holds, and a report of either slot's header: version, hash, pending, tried, confirmed. |

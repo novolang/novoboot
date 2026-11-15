@@ -270,6 +270,39 @@ fn test_a_transfer_resumes_from_the_last_page_that_holds_data() [io, mutate]
     test.assert(holds(1, img))
 
 @test
+fn test_an_image_is_whole_when_its_last_page_is_written() [io, mutate]
+    with_old(image(0x01000000, 2000, 9))
+    test.assert(not bootslot.whole(ram, var pol))
+
+    test.case("a header alone and a header with pages are part of an image")
+    let img = image(0x01020003, 3000, 1)
+    fill(img, 0, HB)
+    test.assert_eq(bootslot.accept_header(ram, var pol, var pg), 0)
+    test.assert_eq(bootslot.begin(ram, var pol), 0)
+    test.assert(bootslot.staged(ram, var pol))
+    test.assert(not bootslot.whole(ram, var pol))
+    var off = 0
+    for _p in 0..5
+        fill(img, HB + off, 512)
+        test.assert_eq(bootslot.program(ram, var pol, off, var pg), 0)
+        off = off + 512
+        test.assert(not bootslot.whole(ram, var pol))
+
+    test.case("the last page, of 440 bytes, makes it whole")
+    fill(img, HB + 2560, 440)
+    test.assert_eq(bootslot.program(ram, var pol, 2560, var pg), 0)
+    test.assert(bootslot.whole(ram, var pol))
+
+    test.case("a marked image is whole whatever its pages hold, and a header that fails is not")
+    test.assert_eq(bootslot.commit(ram, var pol), 0)
+    test.assert(bootslot.whole(ram, var pol))
+    for i in 0..440
+        bootram.poke(1, HB + 2560 + i, 0xFF)
+    test.assert(bootslot.whole(ram, var pol))
+    bootram.poke(1, 0, 0)
+    test.assert(not bootslot.whole(ram, var pol))
+
+@test
 fn test_pages_outside_the_image_or_with_nothing_staged_are_refused() [io, mutate]
     with_old(image(0x01000000, 2000, 9))
     fill(image(0x01020003, 700, 1), HB, 512)

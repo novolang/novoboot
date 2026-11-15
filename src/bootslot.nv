@@ -286,6 +286,24 @@ fn page_written<S: ByteSource[f]>(b: S, base: Int, len: Int) -> Bool [f]
             return true
     false
 
+// Whether slot B holds a whole image rather than the part of one that a transfer has written so far.  The header is the first page a
+// transfer writes, so a header that passes its checks says nothing of the bytes after it.  An image whose pending or tried word is
+// programmed is whole, since `commit` hashed it and the bootloader started it.  Any other is whole when the last page of its image
+// holds a byte other than 0xFF: the pages are written in order, so the last one is written when all of them are.  Cheap, a read of
+// at most one page, where the hash reads the image.  A power cut inside the programming of the last page leaves a page that is
+// part written and counts as whole; `commit` and the bootloader's check of the hash refuse that image all the same.
+pub @tier(embedded)
+fn whole<D: SlotDev[e] + ByteSource[f]>(dev: D, var pol: Policy) -> Bool [e, f]
+    let b: D = sb(dev)
+    if bootimg.check_header(b, b.src_len(), pol) != IMG_OK
+        return false
+    if bootimg.is_pending(b) or bootimg.is_tried(b)
+        return true
+    // The header's check has refused an image of no bytes, so `n` is at least 1.
+    let n = bootimg.image_bytes(b)
+    let at = ((n + PAGE_BYTES - 1) / PAGE_BYTES - 1) * PAGE_BYTES
+    page_written(b, pol.header_bytes + at, n - at)
+
 // Where a transfer resumes: the image offset of the start of the last
 // 512-byte page that holds a byte other than 0xFF, 0 when none does, and
 // the whole image when it is already marked for the next boot.
