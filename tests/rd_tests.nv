@@ -1,0 +1,193 @@
+// rd_tests: the RD certificate's checks, run on the host with the same code
+// the bootloader runs on a device.
+//
+//   novo test tests/rd_tests.nv
+//
+// The four certificates are the toolchain's: `novo image rd --target=
+// nrf54lm20-dk` made them, and each case changes some bytes of one or
+// writes words into the tail the way the bootloader counts boots.  The
+// production key is the Ed25519 key whose private half is the bytes 0 to
+// 31 (the public half is KEY_HEX, the key tests/image_tests.nv signs
+// images with); the development key's is the bytes 32 to 63.
+//
+//   A  device 0123456789abcdef, 3 boots, an unsigned image or one signed
+//      by the development key
+//   B  the same device, 3 boots, the development key's images only
+//   C  device 1111111122222222, 3 boots, unsigned
+//   D  the same device as A, signed by the key whose private half is the
+//      bytes 64 to 95
+
+use std.test
+use std.bytes
+use bytes32
+use bootimg
+use rdcert
+use hostsrc
+
+let KEY_HEX = "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8"
+
+fn cert_a() -> Str
+    str.join([
+        "4e52444301000300030000000200000067452301efcdab89000000000000000029acbae141bccaf0b22e1a94d34d0bc7361e526d0bfe12c89794bc9322966dd7",
+        "4027dde2aaad07298b275d0ce59ca6ab83fc17aa068f0e26e18a852b0cac79a0e05276625a648ffeb769b418621bee3677470339fd9bb138075e1e397228b90f"
+    ], "")
+
+fn cert_b() -> Str
+    str.join([
+        "4e52444301000200030000000200000067452301efcdab89000000000000000029acbae141bccaf0b22e1a94d34d0bc7361e526d0bfe12c89794bc9322966dd7",
+        "cac13de743b378ec86c5923c10af50c528215a00c3a11d3bf4928a5c9be3b0f2c75c9dd66e604f0279a97114d930d2c9faff9183baa4ea797dbb6c31fb3f3708"
+    ], "")
+
+fn cert_c() -> Str
+    str.join([
+        "4e524443010001000300000002000000111111112222222200000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        "7bd94b1712e59069c64bc8d664dcc48548929fbb863ead37cc029b6998e06d38bfce61e052efb4ad595b19bb38a29194fee2c8cd9ed61fbf0b24c304afa60f0b"
+    ], "")
+
+fn cert_d() -> Str
+    str.join([
+        "4e52444301000100030000000200000067452301efcdab8900000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        "417866234a15eb20ab8dee70acd7315dcc8ff300b6aef198b719c4b447ad574a6295354e433cda5c29dbb429aecff3e8d1bfbed23ec6f6c7f357bd1efa45730c"
+    ], "")
+
+fn key() -> B32
+    let h = bytes.from_hex(KEY_HEX) ?? bytes.zeros(32)
+    var k = bytes32.b32_zero()
+    for i in 0..32
+        k.put(i, bytes.byte_at(h, i) ?? 0)
+    k
+
+// The chip's own number as the bootloader reads it: the bytes of two words.
+fn id_of(hex: Str) -> hostsrc.BytesSrc
+    hostsrc.bytes_src(bytes.from_hex(hex) ?? bytes.zeros(0))
+
+fn device() -> hostsrc.BytesSrc
+    id_of("67452301efcdab89")
+
+// The 512 bytes of a unit that holds the certificate `hex` and an erased tail.
+fn unit(hex: Str) -> Bytes
+    var u = bytes.zeros(512)
+    for i in 0..512
+        u = bytes.set_u8(u, i, 0xFF)
+    let head = bytes.from_hex(hex) ?? bytes.zeros(0)
+    for i in 0..128
+        u = bytes.set_u8(u, i, bytes.byte_at(head, i) ?? 0xFF)
+    u
+
+// `u` with the byte at `off` replaced.
+fn put(u: Bytes, off: Int, v: Int) -> Bytes
+    bytes.set_u8(bytes.clone(u), off, v)
+
+// `u` with the first `n` words of the tail written, as the bootloader counts.
+fn counted(u: Bytes, n: Int) -> Bytes
+    var out = bytes.clone(u)
+    for k in 0..n
+        for j in 0..4
+            out = bytes.set_u8(out, 128 + 4 * k + j, (rdcert.RD_COUNT_MARK >> (8 * j)) & 255)
+    out
+
+fn verdict_of(u: Bytes) -> Int
+    rdcert.verdict(hostsrc.bytes_src(u), key(), true, device(), 2)
+
+// The name the bootloader's log gives a verdict.
+fn name(v: Int) -> Str
+    match v
+        0 => "none"
+        1 => "for this device"
+        2 => "other device"
+        3 => "bad signature"
+        4 => "spent"
+        5 => "bad format"
+        6 => "no key"
+        _ => "no device id"
+
+fn name_of(u: Bytes) -> Str
+    name(verdict_of(u))
+
+@test
+fn test_erased_unit_says_nothing()
+    var u = bytes.zeros(512)
+    for i in 0..512
+        u = bytes.set_u8(u, i, 0xFF)
+    test.assert_eq(verdict_of(u), rdcert.RD_NONE, "an erased unit")
+    test.assert_eq_str(name_of(u), "none")
+
+@test
+fn test_certificate_for_this_device()
+    let u = unit(cert_a())
+    test.assert_eq_str(name_of(u), "for this device")
+    let src = hostsrc.bytes_src(u)
+    test.assert_eq(rdcert.served(src), 0, "no boot served yet")
+    test.assert_eq(rdcert.bound(src), 3, "three boots")
+
+@test
+fn test_what_a_certificate_opens()
+    let a = hostsrc.bytes_src(unit(cert_a()))
+    test.assert_eq(rdcert.flags(a), rdcert.RD_FLAG_UNSIGNED | rdcert.RD_FLAG_DEV_KEY, "A: unsigned or the development key")
+    test.assert_eq(a.src_at(0x20), 0x29, "the key's first byte")
+    test.assert_eq(a.src_at(0x3F), 0xD7, "the key's last byte")
+    test.assert_eq(rdcert.flags(hostsrc.bytes_src(unit(cert_b()))), rdcert.RD_FLAG_DEV_KEY, "B: the development key only")
+    test.assert_eq(rdcert.flags(hostsrc.bytes_src(unit(cert_c()))), rdcert.RD_FLAG_UNSIGNED, "C: unsigned only")
+
+@test
+fn test_other_device_signed_by_the_key()
+    test.assert_eq_str(name_of(unit(cert_c())), "other device")
+    // One word of the id differs.
+    test.assert_eq_str(name_of(put(unit(cert_a()), 0x10, 0x66)), "other device")
+    test.assert_eq_str(name_of(put(unit(cert_a()), 0x14, 0x00)), "other device")
+    // A device id of three words against a certificate of two.
+    test.assert_eq(rdcert.verdict(hostsrc.bytes_src(unit(cert_a())), key(), true,
+                                  id_of("67452301efcdab8900000000"), 3),
+                   rdcert.RD_OTHER_DEVICE, "a different length")
+
+@test
+fn test_signature_refused()
+    test.assert_eq_str(name_of(unit(cert_d())), "bad signature")
+    // A byte of the signed part changed: the bound, the flags, the key.
+    test.assert_eq_str(name_of(put(unit(cert_a()), 0x08, 0x60)), "bad signature")
+    test.assert_eq_str(name_of(put(unit(cert_b()), 0x06, 3)), "bad signature")
+    test.assert_eq_str(name_of(put(unit(cert_a()), 0x20, 0x28)), "bad signature")
+    // A byte of the signature changed.
+    test.assert_eq_str(name_of(put(unit(cert_a()), 0x50, 0xAA)), "bad signature")
+
+@test
+fn test_no_key_and_no_id()
+    let src = hostsrc.bytes_src(unit(cert_a()))
+    test.assert_eq(rdcert.verdict(src, key(), false, device(), 2), rdcert.RD_NO_KEY, "no key to check with")
+    test.assert_eq(rdcert.verdict(src, key(), true, device(), 0), rdcert.RD_NO_ID, "a chip with no id")
+    test.assert_eq_str(name(rdcert.RD_NO_KEY), "no key")
+    test.assert_eq_str(name(rdcert.RD_NO_ID), "no device id")
+
+@test
+fn test_not_a_certificate()
+    test.assert_eq_str(name_of(put(unit(cert_a()), 0, 0x4F)), "bad format")
+    test.assert_eq_str(name_of(put(unit(cert_a()), 4, 2)), "bad format")
+    test.assert_eq_str(name_of(put(unit(cert_a()), 0x0C, 0)), "bad format")
+    test.assert_eq_str(name_of(put(unit(cert_a()), 0x0C, 5)), "bad format")
+
+@test
+fn test_boots_are_counted()
+    let u = unit(cert_a())
+    test.assert_eq_str(name_of(counted(u, 1)), "for this device")
+    test.assert_eq(rdcert.served(hostsrc.bytes_src(counted(u, 1))), 1, "one served")
+    test.assert_eq(rdcert.bound(hostsrc.bytes_src(counted(u, 2))) - rdcert.served(hostsrc.bytes_src(counted(u, 2))), 1, "one left after two")
+    test.assert_eq_str(name_of(counted(u, 3)), "spent")
+    test.assert_eq_str(name_of(counted(u, 5)), "spent")
+    // A spent certificate that does not verify says so before it says spent.
+    test.assert_eq_str(name_of(counted(unit(cert_d()), 3)), "bad signature")
+
+@test
+fn test_the_count_stops_at_the_first_erased_word()
+    // Word 1 written and word 0 erased: nothing was counted.
+    var u = bytes.clone(unit(cert_a()))
+    for j in 0..4
+        u = bytes.set_u8(u, 132 + j, 0)
+    test.assert_eq(rdcert.served(hostsrc.bytes_src(u)), 0, "a gap ends the count")
+
+@test
+fn test_the_bound_is_the_tails()
+    let u = put(unit(cert_a()), 0x08, 200)
+    test.assert_eq(rdcert.bound(hostsrc.bytes_src(u)), 96, "no more boots than words")
+    let full = counted(u, 96)
+    test.assert_eq(rdcert.served(hostsrc.bytes_src(full)), 96, "the whole tail")
+    test.assert_eq(rdcert.bound(hostsrc.bytes_src(full)) - rdcert.served(hostsrc.bytes_src(full)), 0, "none left")

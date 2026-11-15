@@ -17,6 +17,20 @@ the images through the swap area with a record in the status region
 (`swaprec.nv`), and starts slot A, an image on trial under the watchdog.
 Build it with `novo build --target=<board> --role=bootloader src/main.nv`.
 
+**The RD certificate** (`src/rdcert.nv`) is a development opening on a
+production device.  Where the table says `signing = "required"` and the
+status region has a unit for it, the bootloader reads a record there before
+it checks the slots: a certificate the release key signed, for this
+device's factory id, that lets the device take an unsigned image, or one
+signed by a development key, for a bounded number of boots.  It says one
+line (`rd: for this device, 11 boots left`, `rd: other device`, `rd: bad
+signature`, `rd: spent`, `rd: unusable`) and counts the boot in the unit's
+tail.  `novo image rd` makes a certificate, `novo flash --rd` and the file
+group's `/rd` write it and `novo flash --rd-erase` revokes it; [the
+bootloader page](../../docs/embedded/bootloader.md#rd) has the record, the
+unit and the lines.  The package's `rdcert` functions check a certificate
+over any `ByteSource`, so the host suite runs the bootloader's own code.
+
 **The slot writer** (`src/bootslot.nv`) is what a running application
 calls to stage an update.  It writes slot B and nothing else.
 
@@ -55,6 +69,7 @@ novo pkg add novoboot
 novo test tests/vectors_tests.nv     #  7: SHA-256 and Ed25519 against the published vectors
 novo test tests/abrule_tests.nv      #  2: the A/B rule, case by case
 novo test tests/bootslot_tests.nv    # 15: the slot writer on RAM slots, a power cut at every flash operation
+novo test tests/rd_tests.nv          # 10: the RD certificate on four certificates the toolchain made
 ```
 
 `tests/bootslot_tests.nv` cuts the power at each of the 60 flash
@@ -62,6 +77,9 @@ operations of an update, once leaving the operation undone and once
 tearing it after 8 bytes, and asks `abrule.nv` over `bootimg.nv`'s checks
 what the bootloader would start: the old image or the new one whole, each
 time; the update run again leaves the new image pending.
+`tests/rd_tests.nv` checks the certificate for this device, for another
+device, signed by another key, with a byte changed, with a magic that is not
+one, with its boots counted and spent, and the opening each one gives.
 `tests/orbit/test_novoboot.sh` in the novo-lang repository runs these, the
 `[flash]` table's checks, the stamped headers and the bootloader's build,
 and builds `tests/slot_probe.nv` for each board with a table.  Each

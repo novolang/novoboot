@@ -22,11 +22,19 @@
 // Each step is a line over the log transport, which the bench reads:
 // the two slots' checks, the rule, the measured times of the hash and
 // the signature check, and the address it starts.
+//
+// Where the table says `signing = "required"`, the status region's last
+// unit may hold an RD certificate (rdcert.nv): a record the production key
+// signed that lets this one device take an unsigned image, or one signed
+// by a development key, for a bounded number of boots.  The bootloader
+// reads it before it checks the slots, says what it found in one line, and
+// counts the boot in the unit's tail.
 
 use bytes32
 use bootimg
 use abrule
 use swaprec
+use rdcert
 
 // How long to wait before starting the image, in milliseconds.  0 in
 // use; the bench's coverage image waits so the probe can read the
@@ -71,11 +79,13 @@ fn slot_a() -> FlashRange [hw]
 fn slot_b() -> FlashRange [hw]
     FlashRange { base: bsp.board.flash_slot_b_start(), n: bsp.board.flash_slot_b_bytes() }
 
-// The regions the swap writes, from the board's [flash] table.
+// The regions the swap writes, from the board's [flash] table.  The swap
+// record has the status region but for the certificate's unit, its last.
 fn layout() -> Layout [hw]
     Layout { a: bsp.board.flash_slot_a_start(), b: bsp.board.flash_slot_b_start(),
              sw: bsp.board.flash_swap_start(), st: bsp.board.flash_status_start(),
-             st_bytes: bsp.board.flash_status_bytes(), slot_bytes: bsp.board.flash_slot_a_bytes() }
+             st_bytes: bsp.board.flash_status_bytes() - bsp.board.flash_rd_bytes(),
+             slot_bytes: bsp.board.flash_slot_a_bytes() }
 
 // The public key this build carries, from the user's signing key at
 // build time; absent when the configuration names none.
@@ -102,11 +112,62 @@ fn key() -> B32 [hw]
 // The chip id is the build's, not read from the chip: an identity word
 // is not readable by software on every chip once no debugger is
 // attached.
-fn policy() -> Policy [hw]
+fn policy(rdf: Int) -> Policy [hw]
     Policy { header_bytes: bsp.board.flash_header_bytes(), chip: bsp.board.flash_chip_id(),
              board: bsp.board.flash_board_id(),
-             signing_required: bsp.board.flash_signing_required() == 1,
+             signing_required: bsp.board.flash_signing_required() == 1 and (rdf & RD_FLAG_UNSIGNED) == 0,
              key_present: bsp.board.flash_key_present() == 1, key: key() }
+
+// ── The RD certificate ───────────────────────────────────────────────
+
+// Reads the certificate unit when signing is required and the board has
+// one, says what it found, and counts the boot of a valid one; answers
+// what the certificate allows (rdcert.flags), 0 for none.  The line is
+// "rd: for this device, N boots left", "rd: other device", "rd: bad
+// signature" or "rd: spent"; a unit that cannot serve at all (not a
+// certificate this bootloader reads, no key to check it with, a chip with
+// no device id) says "rd: unusable", and an erased unit says nothing.  A
+// certificate whose count cannot be written serves nothing, and says
+// spent.
+fn rd_open() -> Int [hw]
+    if bsp.board.flash_signing_required() != 1 or bsp.board.flash_rd_bytes() == 0
+        return 0
+    let start = bsp.board.flash_rd_start()
+    let unit = FlashRange { base: start, n: RD_RECORD_BYTES }
+    // The chip's own number, read as the bytes of its registers.
+    let id = FlashRange { base: bsp.board.flash_devid_addr(), n: 16 }
+    let v = rdcert.verdict(unit, key(), bsp.board.flash_key_present() == 1, id,
+                           bsp.board.flash_devid_words())
+    if v == RD_NONE
+        return 0
+    say("rd: ")
+    let served = rdcert.served(unit)
+    var rc = 1
+    if v == RD_OK
+        rc = hal.boot.write_word(start + RD_HEAD_BYTES + 4 * served, RD_COUNT_MARK)
+    if rc == 0
+        say("for this device, ")
+        say_int(rdcert.bound(unit) - served - 1)
+        say(" boots left\n")
+        return rdcert.flags(unit)
+    if v == RD_OTHER_DEVICE
+        say("other device\n")
+    else if v == RD_BAD_SIGNATURE
+        say("bad signature\n")
+    else if v == RD_SPENT or v == RD_OK
+        say("spent\n")
+    else
+        say("unusable\n")
+    0
+
+// `pol` with the certificate's development key as the key the signature is
+// checked against, read from the unit.
+fn dev_policy(pol: Policy) -> Policy [hw]
+    var k = bytes32.b32_zero()
+    for i in 0..32
+        k.put(i, hw.mem_read8(bsp.board.flash_rd_start() + 0x20 + i))
+    Policy { header_bytes: pol.header_bytes, chip: pol.chip, board: pol.board,
+             signing_required: pol.signing_required, key_present: true, key: k }
 
 // The check of one slot, logged, with the time the hash and the
 // signature check took.
@@ -115,7 +176,7 @@ fn policy() -> Policy [hw]
 // it did not cause on some chips (the nRF52's through a soft reset), so
 // the check feeds it around the hash and the signature check, the two
 // long parts.
-fn check(name: Str, slot: FlashRange, pol: Policy) -> SlotState [hw]
+fn check(name: Str, slot: FlashRange, pol: Policy, rdf: Int) -> SlotState [hw]
     hal.watchdog.feed()
     var r = bootimg.check_header(slot, slot.n, pol)
     if r == IMG_OK
@@ -131,6 +192,8 @@ fn check(name: Str, slot: FlashRange, pol: Policy) -> SlotState [hw]
             let signed = (bootimg.flags(slot) & FLAG_UNSIGNED) == 0
             let t2 = hal.timer.ticks_us()
             r = bootimg.check_signature(slot, pol)
+            if r == IMG_BAD_SIGNATURE and (rdf & RD_FLAG_DEV_KEY) != 0
+                r = bootimg.check_signature(slot, dev_policy(pol))
             let t3 = hal.timer.ticks_us()
             hal.watchdog.feed()
             if signed
@@ -225,12 +288,13 @@ fn main() [hw]
     if resumed < 0 or resumed > 1
         // cov: skip — runs only when the flash refuses an erase or a write while a swap is finished, which a healthy chip never does
         say_kv("swap resume failed", resumed)
-    let pol = policy()
+    let rdf = rd_open()
+    let pol = policy(rdf)
     say_kv("signing required", bsp.board.flash_signing_required())
     say_kv("trial ms", bsp.board.flash_trial_ms())
     say_kv("key", bsp.board.flash_key_present())
-    let a = check("a", slot_a(), pol)
-    let b = check("b", slot_b(), pol)
+    let a = check("a", slot_a(), pol, rdf)
+    let b = check("b", slot_b(), pol, rdf)
     let act = abrule.decide(a, b)
     say("rule: ")
     say(abrule.action_name(act))
@@ -244,7 +308,7 @@ fn main() [hw]
         if rc != 0
             // cov: skip — runs only when the flash refuses an erase or a write inside a slot, which a healthy chip never does
             say_kv("swap failed", rc)
-        let again = check("a", slot_a(), pol)
+        let again = check("a", slot_a(), pol, rdf)
         if not again.valid
             // cov: skip — runs only when the copy did not take, after a refusal of the flash above
             halt()

@@ -73,12 +73,12 @@ struct Policy
     key: B32
 
 @tier(embedded)
-fn u32_at<S: ByteSource[e]>(src: S, off: Int) -> Int [e]
+pub fn u32_at<S: ByteSource[e]>(src: S, off: Int) -> Int [e]
     src.src_at(off) | (src.src_at(off + 1) << 8) | (src.src_at(off + 2) << 16)
         | (src.src_at(off + 3) << 24)
 
 @tier(embedded)
-fn u16_at<S: ByteSource[e]>(src: S, off: Int) -> Int [e]
+pub fn u16_at<S: ByteSource[e]>(src: S, off: Int) -> Int [e]
     src.src_at(off) | (src.src_at(off + 1) << 8)
 
 @tier(embedded)
@@ -156,6 +156,16 @@ pub fn check_hash<S: ByteSource[e]>(slot: S) -> Bool [e]
         diff = diff | (h.at(i) ^ slot.src_at(0x20 + i))
     diff == 0
 
+// Whether the 64 bytes at 0x40 of `src` are the Ed25519 signature of its
+// first 0x40 bytes under `key`: the shape of an image header and of an RD
+// certificate (rdcert.nv).
+@tier(embedded)
+pub fn signed_by<S: ByteSource[e]>(src: S, key: B32) -> Bool [e]
+    var sig = bytes32.b64_zero()
+    for i in 0..64
+        sig.put(i, src.src_at(0x40 + i))
+    ed25519.verify(key, sig, src.src_window(0, 0x40))
+
 // The signature policy: an unsigned image passes where signing is
 // optional and is refused where it is required; a signed one passes
 // when its signature over the header's first 0x40 bytes verifies under
@@ -168,10 +178,7 @@ pub fn check_signature<S: ByteSource[e]>(slot: S, pol: Policy) -> Int [e]
         return IMG_OK
     if not pol.key_present
         return IMG_NO_KEY
-    var sig = bytes32.b64_zero()
-    for i in 0..64
-        sig.put(i, slot.src_at(0x40 + i))
-    if ed25519.verify(pol.key, sig, slot.src_window(0, 0x40))
+    if signed_by(slot, pol.key)
         return IMG_OK
     IMG_BAD_SIGNATURE
 

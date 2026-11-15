@@ -70,6 +70,16 @@
 #      image with one bit changed is refused for its hash, re-hashed it
 #      is refused for its signature, and with S + L in place of S it is
 #      refused; a bootloader with no key refuses a signed image;
+#   8b. the RD certificate, on a board whose status region has a unit for it:
+#      an unsigned image refused with the unit erased; a certificate for
+#      this device, made by `novo image rd` and written by `novo flash
+#      --rd`, takes it for the boots it names, counted in the unit's tail,
+#      and refuses it again once they are spent; a certificate for another
+#      device, one signed by another key, one with a byte changed and one
+#      whose magic is not a certificate's each change nothing and are named
+#      in the log; `novo flash --rd-erase` revokes; a certificate of the
+#      development key takes an image signed by that key and no other;
+#      and a swap leaves the unit and its count alone;
 #   9. the measured time of the hash and the signature check, from the
 #      bootloader without coverage hooks;
 #  10. every line of the bootloader's and the header library's device
@@ -314,6 +324,11 @@ OUT=""
 expect() {
   if grep -qxF -- "$1" <<< "$OUT"; then pass "$2"
   else fail "$2: no line '$1'" "$(grep -av '^\s*$' <<< "$OUT" | tail -14)"; fi
+}
+# A line that begins with the text: the marks an image carries (pending, tried, confirmed) follow the words that are checked.
+expect_has() {
+  if grep -aq -- "^$1" <<< "$OUT"; then pass "$2"
+  else fail "$2: no line beginning '$1'" "$(grep -av '^\s*$' <<< "$OUT" | tail -14)"; fi
 }
 value() { sed -n "s/^$1=\\(-\\?[0-9]*\\)$/\\1/p" <<< "$OUT" | tail -1; }
 word() { pr read b32 "0x$(printf '%08X' $(( $1 )))" 1 2> /dev/null | awk '{print $2}' | tail -1; }
@@ -654,6 +669,177 @@ boot "$WORK/boot_nokey.elf" s7f
 expect "key=0"                                     "a bootloader built with no signing key configured"
 expect "slot a: no key"                            "refuses the signed image it cannot check"
 
+# ── 8b. the RD certificate ──────────────────────────────────────────────────
+echo ""
+echo "8b. the RD certificate"
+# The unit is the status region's last erase unit when the swap record leaves one whole unit unused (compiler/lib/flashtable.ml, rd_unit);
+# the table gives the same answer here.
+RD_START=$(python3 - "$BOARD_DIR/novo.toml" <<'PY'
+import re, sys
+t = open(sys.argv[1]).read()
+def pair(role):
+    m = re.search(r'^%s\s*=\s*\[\s*(0x[0-9A-Fa-f]+|\d+)\s*,\s*(0x[0-9A-Fa-f]+|\d+)\s*\]' % role, t, re.M)
+    return (int(m.group(1), 0), int(m.group(2), 0)) if m else None
+runs = re.search(r'^erase_units\s*=\s*\[\s*\[\s*(0x[0-9A-Fa-f]+|\d+)\s*,\s*(\d+)\s*\]\s*\]', t, re.M)
+st, sa = pair('status'), pair('slot_a')
+if runs and st and sa:
+    unit = int(runs.group(1), 0)
+    need = 0x20 + 12 * (sa[1] // unit)
+    used = -(-need // unit)
+    if st[1] // unit > used and unit >= 512:
+        print("%X" % (st[0] + st[1] - unit))
+PY
+)
+if [ -z "$RD_START" ]; then
+  skip "the status region of the $SLUG's table has no spare erase unit for a certificate"
+else
+  RDV="--target=$SLUG --probe=$SEL"
+  DEV_ID=$("$NOVO" flash $RDV --device-id 2> "$WORK/devid.err")
+  if [[ "$DEV_ID" =~ ^[0-9a-f]{16}$ ]]; then
+    pass "novo flash --device-id reads the chip's id through the probe: $DEV_ID"
+  else
+    fail "novo flash --device-id" "${DEV_ID:-nothing} $(cat "$WORK/devid.err")"
+  fi
+  OTHER_ID="${DEV_ID:0:15}$(printf '%x' $(( (16#${DEV_ID:15:1} + 1) & 15 )))"
+  openssl genpkey -algorithm ed25519 -out "$WORK/otherkey.pem" 2> /dev/null
+  printf '[signing]\nkey = "%s"\n' "$WORK/otherkey.pem" > "$WORK/otherkey.toml"
+  openssl genpkey -algorithm ed25519 -out "$WORK/devkey.pem" 2> /dev/null
+  printf '[signing]\nkey = "%s"\n' "$WORK/devkey.pem" > "$WORK/devkey.toml"
+  rdmake() { # rdmake <out> <device> <boots> <flags...>
+    local out="$1" dev="$2" boots="$3"; shift 3
+    NOVO_CONFIG="$WORK/config.toml" "$NOVO" image rd --target="$SLUG" --device "$dev" --boots "$boots" "$@" -o "$out" > "$WORK/rdmake.log" 2>&1
+  }
+  rdput() { "$NOVO" flash $RDV --rd "$1" > "$WORK/rdput.log" 2>&1; }
+  rderase() { "$NOVO" flash $RDV --rd-erase > "$WORK/rdput.log" 2>&1; }
+  norunning() { if grep -q "^rd:" <<< "$OUT"; then fail "$1: the log has an rd line" "$(grep '^rd:' <<< "$OUT")"; else pass "$1: the log has no rd line"; fi; }
+  # app5 is signed by the development key; the configuration of the run's key is the bootloader's.
+  mkdir -p "$WORK/app5"
+  sed -e 's/^let NAME = .*/let NAME = "app5"/' -e 's/^let CONFIRM = .*/let CONFIRM = true/' "$APP_SRC" > "$BOARD_DIR/tests/.boot_app_app5.nv"
+  (cd "$WORK/app5" && NOVO_CONFIG="$WORK/devkey.toml" "$NOVO" build --target="$SLUG" --role=application --image-version=5.0.0 \
+     --memory-report=none --sign -o "$WORK/app5.elf" "$BOARD_DIR/tests/.boot_app_app5.nv") > "$WORK/app5.log" 2>&1
+  rm -f "$BOARD_DIR/tests/.boot_app_app5.nv"
+  [ -f "$WORK/app5.img" ] || { fail "app5 (signed by the development key) does not build" "$(tail -4 "$WORK/app5.log")"; finish; }
+
+  python3 "$TOOL" pend "$WORK/app4.img" "$WORK/app4_pend.img"
+  pr download "$WORK/boot_req.elf" > "$WORK/dl.log" 2>&1
+  rderase
+  put "$WORK/erased_slot.bin" "$SLOT_B"
+  put "$WORK/app1.img" "$SLOT_A"
+
+  # the unit erased: signing = "required" refuses an unsigned image, and the log says nothing of a certificate
+  boot "$WORK/boot_req.elf" s8b0
+  expect_has "slot a: unsigned"                          "no certificate: the unsigned app1 is refused"
+  expect "rule: halt"                                "and nothing starts"
+  norunning "an erased unit"
+
+  # a certificate for this device, three boots
+  rdmake "$WORK/rd_a.bin" "$DEV_ID" 3 --unsigned
+  if rdput "$WORK/rd_a.bin"; then pass "novo flash --rd writes a certificate for this device, three boots, unsigned allowed"; else fail "novo flash --rd" "$(tail -3 "$WORK/rdput.log")"; fi
+  boot "$WORK/boot_req.elf" s8b1
+  expect "rd: for this device, 2 boots left"         "the certificate is read and a boot counted"
+  expect_has "slot a: ok v1.0.0 unsigned"                "app1, unsigned, now passes"
+  expect "rule: boot a"                              "and the rule starts it"
+  run_app "$WORK/app1.elf" "app running" s8b1app
+  expect "app app1"                                  "and it runs"
+  boot "$WORK/boot_req.elf" s8b2
+  expect "rd: for this device, 1 boots left"         "the second boot counted"
+  boot "$WORK/boot_req.elf" s8b3
+  expect "rd: for this device, 0 boots left"         "the third boot counted"
+  expect_has "slot a: ok v1.0.0 unsigned"                "and served"
+  w0=$(word "0x$RD_START + 0x80"); w1=$(word "0x$RD_START + 0x84"); w2=$(word "0x$RD_START + 0x88"); w3=$(word "0x$RD_START + 0x8C")
+  if [ "$w0" = "544f4f42" ] && [ "$w1" = "544f4f42" ] && [ "$w2" = "544f4f42" ] && [ "$w3" = "ffffffff" ]; then
+    pass "the probe reads three counting words in the unit's tail and the fourth erased"
+  else
+    fail "the unit's tail reads $w0 $w1 $w2 $w3"
+  fi
+  boot "$WORK/boot_req.elf" s8b4
+  expect "rd: spent"                                 "the fourth boot: the boots are used"
+  expect_has "slot a: unsigned"                          "and the unsigned image is refused again"
+  expect "rule: halt"                                "nothing starts"
+
+  # another device
+  rdmake "$WORK/rd_c.bin" "$OTHER_ID" 3 --unsigned && rdput "$WORK/rd_c.bin"
+  boot "$WORK/boot_req.elf" s8b5
+  expect "rd: other device"                          "a certificate for another device is named in the log"
+  expect_has "slot a: unsigned"                          "and changes nothing"
+  # another device, differing in the first word
+  OTHER_ID2="$(printf '%x' $(( (16#${DEV_ID:0:1} + 1) & 15 )))${DEV_ID:1}"
+  rdmake "$WORK/rd_c2.bin" "$OTHER_ID2" 3 --unsigned && rdput "$WORK/rd_c2.bin"
+  boot "$WORK/boot_req.elf" s8b5b
+  expect "rd: other device"                          "and one that differs in the first word"
+  expect_has "slot a: unsigned"                      "changes nothing either"
+  # another key
+  NOVO_CONFIG="$WORK/otherkey.toml" "$NOVO" image rd --target="$SLUG" --device "$DEV_ID" --boots 3 --unsigned -o "$WORK/rd_d.bin" > /dev/null 2>&1 && rdput "$WORK/rd_d.bin"
+  boot "$WORK/boot_req.elf" s8b6
+  expect "rd: bad signature"                         "a certificate signed by another key is named in the log"
+  expect_has "slot a: unsigned"                          "and changes nothing"
+  # a damaged byte (the bound), and an unreadable unit
+  python3 "$TOOL" flip "$WORK/rd_a.bin" "$WORK/rd_e.bin" 8 5
+  rdput "$WORK/rd_e.bin"
+  boot "$WORK/boot_req.elf" s8b7
+  expect "rd: bad signature"                         "a certificate with one bit of its bound changed is named in the log"
+  expect_has "slot a: unsigned"                          "and changes nothing"
+  python3 "$TOOL" flip "$WORK/rd_a.bin" "$WORK/rd_f.bin" 0 1
+  python3 -c "import sys; sys.stdout.buffer.write(open(sys.argv[1],'rb').read() + b'\xff' * 384)" "$WORK/rd_f.bin" > "$WORK/rd_f_unit.bin"
+  put "$WORK/rd_f_unit.bin" "$RD_START"
+  boot "$WORK/boot_req.elf" s8b8
+  expect "rd: unusable"                              "a unit whose magic is not a certificate's is named in the log"
+  expect_has "slot a: unsigned"                          "and changes nothing"
+
+  # a bootloader built with no key cannot check a certificate
+  rdmake "$WORK/rd_k.bin" "$DEV_ID" 3 --unsigned && rdput "$WORK/rd_k.bin"
+  pr download "$WORK/boot_nokey.elf" > "$WORK/dl.log" 2>&1
+  boot "$WORK/boot_nokey.elf" s8b8k
+  expect "rd: unusable"                              "a bootloader with no key says a valid certificate is unusable"
+  expect_has "slot a: unsigned"                      "and changes nothing"
+  pr download "$WORK/boot_req.elf" > "$WORK/dl.log" 2>&1
+
+  # revocation
+  rdmake "$WORK/rd_g.bin" "$DEV_ID" 5 --unsigned && rdput "$WORK/rd_g.bin"
+  boot "$WORK/boot_req.elf" s8b9
+  expect "rd: for this device, 4 boots left"         "a fresh certificate for this device, five boots"
+  expect_has "slot a: ok v1.0.0 unsigned"                "takes the unsigned image"
+  if rderase; then pass "novo flash --rd-erase erases the unit"; else fail "novo flash --rd-erase" "$(tail -3 "$WORK/rdput.log")"; fi
+  boot "$WORK/boot_req.elf" s8b10
+  expect_has "slot a: unsigned"                          "and the image is refused again"
+  norunning "a revoked certificate"
+
+  # the development key
+  rdmake "$WORK/rd_h.bin" "$DEV_ID" 6 --dev-key "$WORK/devkey.pem" && rdput "$WORK/rd_h.bin"
+  put "$WORK/app5.img" "$SLOT_A"
+  boot "$WORK/boot_req.elf" s8b11
+  expect "rd: for this device, 5 boots left"         "a certificate of the development key only"
+  expect_has "slot a: ok v5.0.0 signed"                  "takes app5, signed by that key"
+  run_app "$WORK/app5.elf" "app running" s8b11app
+  expect "app app5"                                  "and it runs"
+  put "$WORK/app3.img" "$SLOT_A"
+  boot "$WORK/boot_req.elf" s8b12
+  expect_has "slot a: ok v3.0.0 signed"                  "app3, signed by the production key, still passes"
+  put "$WORK/app1.img" "$SLOT_A"
+  boot "$WORK/boot_req.elf" s8b13
+  expect_has "slot a: unsigned"                          "and an unsigned image is refused: the certificate does not allow one"
+  rdmake "$WORK/rd_i.bin" "$DEV_ID" 6 --unsigned && rdput "$WORK/rd_i.bin"
+  put "$WORK/app5.img" "$SLOT_A"
+  boot "$WORK/boot_req.elf" s8b14
+  expect_has "slot a: bad signature"                     "an unsigned-only certificate does not take app5, signed by the development key"
+
+  # a swap leaves the unit and its count alone
+  rdmake "$WORK/rd_j.bin" "$DEV_ID" 8 --unsigned && rdput "$WORK/rd_j.bin"
+  put "$WORK/app1.img" "$SLOT_A"
+  put "$WORK/app4_pend.img" "$SLOT_B"
+  boot "$WORK/boot_req.elf" s8b15
+  expect "rd: for this device, 7 boots left"         "a certificate of eight boots, and app4 pending in slot B"
+  expect "rule: swap, trial a"                       "the swap runs"
+  run_app "$WORK/app4.elf" "app running" s8b15app
+  expect "confirmed after=1"                         "app4 runs and confirms itself"
+  boot "$WORK/boot_req.elf" s8b16
+  expect "rd: for this device, 6 boots left"         "the next boot finds the certificate and its count where the swap left them"
+  expect_has "slot a: ok v2.0.0 unsigned pending tried confirmed" "with app4 in slot A"
+  rderase
+  put "$WORK/app1.img" "$SLOT_A"
+  put "$WORK/erased_slot.bin" "$SLOT_B"
+fi
+
 # ── 9. the times ───────────────────────────────────────────────────────────
 echo ""
 echo "9. the hash and the signature check, timed without coverage hooks"
@@ -692,7 +878,7 @@ tables=("$WORK"/cov_*.bin)
 shopt -u nullglob
 if [ ${#tables[@]} -gt 0 ]; then
   merge "$WORK/cov.bin" "${tables[@]}"
-  for f in main bootimg abrule swaprec imghash sha2 fe25519 ed25519 bytes32; do
+  for f in main bootimg rdcert abrule swaprec imghash sha2 fe25519 ed25519 bytes32; do
     if cov=$(cd "$WORK/b_opt" && python3 "$REPO/scripts/device_coverage.py" "$WORK/boot.elf" "$WORK/cov.bin" \
                "$WORK/b_opt/_novo/main_$SLUG" "src/$f.nv" 2>&1); then
       pass "every line of $f.nv with a hook ran: $(grep -o 'covered .*' <<< "$cov" | tail -1)"

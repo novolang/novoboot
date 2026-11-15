@@ -1,0 +1,113 @@
+// rdcert.nv: the RD certificate, a development opening on a production
+// device, and the checks a bootloader makes of it.
+//
+// A bootloader built with `signing = "required"` takes only images signed
+// with its key.  A certificate in the unit the status region keeps for it
+// lets one device take an unsigned image, or one signed by a development
+// key, for a bounded number of boots.  The toolchain makes it with the
+// production key (`novo image rd`) and the probe writes it (`novo flash
+// --rd`); the bootloader reads it at every start, checks that it is for
+// this device and that the production key signed it, and counts the boot.
+// Erasing the unit revokes it.
+//
+// The record, all words little-endian (compiler/lib/flashtable.ml writes
+// it; docs/embedded/bootloader.md has the table):
+//
+//   0x00  magic, the bytes "NRDC"          0x10  the device id, 16 bytes
+//   0x04  version, 16 bits                       (zero after its last word)
+//   0x06  flags, 16 bits                   0x20  the development public key
+//   0x08  boots, the bound                 0x40  Ed25519 signature over
+//   0x0C  words of the id that count             0x00 to 0x3F
+//   0x80  the tail, 96 words: one is written per boot the certificate
+//         serves; the first erased word is the next to write
+//
+// The checks run cheapest first: the magic, the device, then the
+// signature, then the count, so a unit that is erased costs one read and a
+// certificate for another device costs a few.
+
+use bytes32
+use bootimg
+
+pub const RD_MAGIC = 0x4344524E
+pub const RD_VERSION = 1
+pub const RD_HEAD_BYTES = 0x80
+pub const RD_RECORD_BYTES = 0x200
+pub const RD_TAIL_WORDS = 96
+// Flag bit 0: an unsigned image is allowed.  Bit 1: an image signed by the
+// certificate's development key is allowed.
+pub const RD_FLAG_UNSIGNED = 1
+pub const RD_FLAG_DEV_KEY = 2
+// What the bootloader writes into the tail for a boot it serves.
+pub const RD_COUNT_MARK = 0x544F4F42
+
+// What a check of the unit answers.
+// The unit is erased: no certificate, and no log line.
+pub const RD_NONE = 0
+pub const RD_OK = 1
+// For another device.
+pub const RD_OTHER_DEVICE = 2
+// The production key's signature does not verify.
+pub const RD_BAD_SIGNATURE = 3
+// The boots it serves are used.
+pub const RD_SPENT = 4
+// Not a certificate this bootloader reads: another version, or bytes that
+// are not one.
+pub const RD_BAD_FORMAT = 5
+// The bootloader carries no key to check it with.
+pub const RD_NO_KEY = 6
+// The chip has no device id the bootloader reads.
+pub const RD_NO_ID = 7
+
+// The boots the certificate has served: the tail's words written, counted
+// from the first, up to the first erased one.
+@tier(embedded)
+pub fn served<S: ByteSource[e]>(unit: S) -> Int [e]
+    var n = 0
+    for k in 0..RD_TAIL_WORDS
+        if n == k and bootimg.u32_at(unit, RD_HEAD_BYTES + 4 * k) != 0xFFFFFFFF
+            n = n + 1
+    n
+
+// The boots the certificate may serve: its bound, and no more than the
+// tail holds.
+@tier(embedded)
+pub fn bound<S: ByteSource[e]>(unit: S) -> Int [e]
+    let b = bootimg.u32_at(unit, 0x08)
+    if b > RD_TAIL_WORDS
+        // cov: skip — only a certificate signed with a bound above 96 reaches it, which `novo image rd` refuses to make; tests/rd_tests.nv runs it on the host
+        return RD_TAIL_WORDS
+    b
+
+// What the certificate allows: the flags, RD_FLAG_UNSIGNED and RD_FLAG_DEV_KEY.
+@tier(embedded)
+pub fn flags<S: ByteSource[e]>(unit: S) -> Int [e]
+    bootimg.u16_at(unit, 0x06)
+
+// Whether the unit holds a certificate for this device that the key signed
+// and that has boots left, or why it does not.  `key` is the public half
+// of the production key the bootloader carries; `id` is the bytes of the
+// chip's own number, `id_words` words of them.
+@tier(embedded)
+pub fn verdict<S: ByteSource[e]>(unit: S, key: B32, key_present: Bool, id: S, id_words: Int) -> Int [e]
+    let magic = bootimg.u32_at(unit, 0)
+    if magic == 0xFFFFFFFF
+        return RD_NONE
+    let n = bootimg.u32_at(unit, 0x0C)
+    if magic != RD_MAGIC or bootimg.u16_at(unit, 0x04) != RD_VERSION or n < 1 or n > 4
+        return RD_BAD_FORMAT
+    if id_words == 0
+        // cov: skip — a chip with no device id reaches it, and the board has one; tests/rd_tests.nv runs it on the host
+        return RD_NO_ID
+    if n != id_words
+        // cov: skip — a certificate with another number of id words reaches it, which `novo image rd` writes only for the board's own chip; tests/rd_tests.nv runs it on the host
+        return RD_OTHER_DEVICE
+    for i in 0..16
+        if i < 4 * n and unit.src_at(0x10 + i) != id.src_at(i)
+            return RD_OTHER_DEVICE
+    if not key_present
+        return RD_NO_KEY
+    if not bootimg.signed_by(unit, key)
+        return RD_BAD_SIGNATURE
+    if served(unit) >= bound(unit)
+        return RD_SPENT
+    RD_OK

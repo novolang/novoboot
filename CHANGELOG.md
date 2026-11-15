@@ -6,6 +6,17 @@ pre-1.0 rule that a breaking change bumps the MINOR number.
 
 ## [Unreleased]
 
+### Added
+
+- `rdcert.nv`, the RD certificate: a record the release key signs that names one device by its factory id, allows an unsigned image or an image
+  signed by a development key, and bounds the boots it serves.  The bootloader reads it from the status region's last erase unit at each start
+  where the table says `signing = "required"` and the board has such a unit, says one line (`rd: for this device, N boots left`, `rd: other
+  device`, `rd: bad signature`, `rd: spent`, `rd: unusable`) and counts the boot in the unit's tail, a word for each boot, so the count needs
+  no erase.  `bootimg.signed_by` is the signature check of an image header and of a certificate, and `bootimg.u32_at` and `u16_at` are public.
+  The swap erases the status region below the certificate's unit.  `tests/rd_tests.nv` has the cases, and section 8b of `tests/board_boot.sh`
+  runs them on a board with a unit for the record (the nRF54LM20 DK).  The toolchain makes a certificate with `novo image rd` and writes it
+  with `novo flash --rd`; mcumgr-nv's `/rd` is the second route.
+
 ### Changed
 
 - `bootdev.BoardSlots.program` writes a page with one `hal.boot.copy`, where it called `hal.boot.write_word` at each word.  A word cost the flash driver's write enable, commit and write disable (146 microseconds on the nRF54LM20, 36 milliseconds for the 984 bytes of an upload request in the firmware update demo), and the copy takes them once for the page: 2.6 milliseconds a page with the buffered driver of the board support package, 7.8 milliseconds for a whole request.  It reads the page where it lies, so it checks at each page that a `Vec`'s octets follow its 8-octet length (as `pdu_mem.nv` of the nRF54 blocks does), and falls back to the word loop if they do not.  The board run of `tests/board_boot.sh` is the check; the host has no flash to program.  Filed with the driver as `bugs/orbit/rram-driver-stores-unbuffered.md`.
