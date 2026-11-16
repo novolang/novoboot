@@ -79,17 +79,17 @@ impl ByteSource[hw] for BoardSlots
 // The octets of a `Page` follow its 8-octet length.
 const PAGE_DATA_AT = 8
 
-// cov: skip — the address of a page's octets is read from memory, which only a board maps; tests/slot_probe.nv builds it and the bench runs it
 // The address of the octets of a page: `addr_of` of a `var` parameter answers the slot that holds the struct's address.
 @no_alloc
 @tier(embedded)
+// cov: skip — the address of a page's octets is read from memory, which only a board maps; tests/slot_probe.nv builds it and the bench runs it
 fn page_addr(var src: Page) -> Int [hw]
     hw.mem_read32(addr_of(src)) + PAGE_DATA_AT
 
-// cov: skip — reads the layout of a page through the core, as page_addr does; the bench runs it
 // Whether a page's octets are where `PAGE_DATA_AT` says: the first eight octets of a page just filled, read as two words, are what was
 // written (as `pdu_mem.nv` of the nRF54 blocks checks for a PDU).  A check at each page costs a few microseconds and keeps the module free of state.
 @tier(embedded)
+// cov: skip — reads the layout of a page through the core, as page_addr does; the bench runs it
 fn page_layout_ok() -> Bool [hw]
     var p: Page = Vec.new()
     for i in 0..8

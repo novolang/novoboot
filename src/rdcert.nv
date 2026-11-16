@@ -74,7 +74,6 @@ pub fn served<S: ByteSource[e]>(unit: S) -> Int [e]
 pub fn bound<S: ByteSource[e]>(unit: S) -> Int [e]
     let b = bootimg.u32_at(unit, 0x08)
     if b > RD_TAIL_WORDS
-        // cov: skip — only a certificate signed with a bound above 96 reaches it, which `novo image rd` refuses to make; tests/rd_tests.nv runs it on the host
         return RD_TAIL_WORDS
     b
 
@@ -96,10 +95,8 @@ pub fn verdict<S: ByteSource[e]>(unit: S, key: B32, key_present: Bool, id: S, id
     if magic != RD_MAGIC or bootimg.u16_at(unit, 0x04) != RD_VERSION or n < 1 or n > 4
         return RD_BAD_FORMAT
     if id_words == 0
-        // cov: skip — a chip with no device id reaches it, and the board has one; tests/rd_tests.nv runs it on the host
         return RD_NO_ID
     if n != id_words
-        // cov: skip — a certificate with another number of id words reaches it, which `novo image rd` writes only for the board's own chip; tests/rd_tests.nv runs it on the host
         return RD_OTHER_DEVICE
     for i in 0..16
         if i < 4 * n and unit.src_at(0x10 + i) != id.src_at(i)
