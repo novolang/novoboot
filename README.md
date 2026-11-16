@@ -60,7 +60,7 @@ novo pkg add novoboot
 ```
 
 [dfu-nv](../dfu-nv/README.md) 0.2.0 depends on it by path, and
-[mcumgr-nv](https://novo-lang.org/packages/mcumgr-nv) 0.1.2 by the range
+[mcumgr-nv](https://novo-lang.org/packages/mcumgr-nv) 0.2.0 by the range
 `^0.2.1`; their device programs are the writer in use.
 
 ## Tests
